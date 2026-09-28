@@ -14,3 +14,14 @@
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | 핫딜 봇 토큰 (필수) |
 | `GEMINI_API_KEY` | Gemini API 키 (연관어 확장·자연어 명령 해석용) |
+
+## 내 PC에서 실행 (권장)
+펨코(430)·뽐뿌(403) 모두 GitHub 서버(해외 IP) 접속을 막기 때문에, 딜 수집은 국내 IP인 내 PC에서 돌려야 합니다.
+
+1. 이 저장소를 zip으로 받아 계속 둘 폴더에 풀기 (Python 3 필요)
+2. 그 폴더에서 `powershell -ExecutionPolicy Bypass -File setup_pc.ps1` 실행
+   → 메모장에 `.env`가 열리면 봇 토큰·Gemini 키를 붙여넣고 저장 → 한 번 더 실행
+3. 작업 스케줄러에 `HotdealBot`(15분마다)이 등록됩니다. 로그는 `logs/` 폴더
+4. PC로 옮긴 뒤에는 GitHub Actions의 `핫딜 알리미` 워크플로를 **Disable** 해 주세요 (텔레그램 메시지를 둘이 나눠 받는 충돌 방지)
+
+PC가 꺼져 있는 동안의 명령은 켜진 뒤 처리됩니다(텔레그램이 24시간 보관). PC 실행 시 키워드는 로컬 `keywords.json`에만 저장됩니다.
