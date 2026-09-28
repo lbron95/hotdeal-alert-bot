@@ -184,14 +184,15 @@ def match_keyword(title, kws):
 
 # ───────────────────────── Gemini ─────────────────────────
 def gemini_json(prompt):
-    last = None
-    for model in CONFIG.get("ai", {}).get("models", ["gemini-2.5-flash"]):
+    errors = []
+    for model in CONFIG.get("ai", {}).get("models", ["gemini-3.5-flash"]):
+        last = None
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         body = {"contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
         for _ in range(2):
             try:
-                r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=60)
+                r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=60)
                 if r.status_code in (429, 500, 503):
                     last = f"{model} {r.status_code}"
                     time.sleep(4)
@@ -203,7 +204,8 @@ def gemini_json(prompt):
             except Exception as e:
                 last = f"{model}: {e}"
                 break
-    raise RuntimeError(f"Gemini 실패 ({last})")
+        errors.append(last)
+    raise RuntimeError("Gemini 실패 (" + " / ".join(map(str, errors)) + ")")
 
 
 EXPAND_RULE = (
