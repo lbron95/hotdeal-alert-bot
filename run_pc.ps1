@@ -3,6 +3,7 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 $env:PYTHONIOENCODING = "utf-8"
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 Get-Content ".env" -Encoding utf8 | ForEach-Object {
     if ($_.TrimStart([char]0xFEFF) -match '^\s*([A-Z_]+)\s*=\s*(.+?)\s*$') { Set-Item "env:$($Matches[1])" $Matches[2] }
