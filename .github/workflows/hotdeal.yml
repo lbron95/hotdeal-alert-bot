@@ -1,0 +1,64 @@
+name: 핫딜 알리미
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # 15분마다: 텔레그램 명령 처리 (딜 확인은 3시간 단위로 스크립트가 판단)
+  workflow_dispatch:
+    inputs:
+      force_scan:
+        description: "지금 바로 딜 확인하기"
+        type: boolean
+        default: false
+
+concurrency:
+  group: hotdeal
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 이전 기록 불러오기
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: hotdeal-state-${{ github.run_id }}
+          restore-keys: hotdeal-state-
+
+      - name: 명령 처리 + 핫딜 확인
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FORCE_SCAN: ${{ inputs.force_scan && '1' || '0' }}
+        run: python hotdeal.py
+
+      - name: 기록 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: hotdeal-state-${{ github.run_id }}
+
+      - name: 키워드 변경 저장
+        run: |
+          if ! git diff --quiet -- keywords.json; then
+            git config user.name "hotdeal-bot"
+            git config user.email "hotdeal-bot@users.noreply.github.com"
+            git add keywords.json
+            git commit -m "텔레그램 명령으로 키워드 변경"
+            git pull --rebase -q
+            git push
+          fi
