@@ -1,7 +1,7 @@
 """
 핫딜 알리미 — 에펨코리아·뽐뿌 새 핫딜 중 '내 키워드'에 맞는 글만 텔레그램으로 보내줍니다.
 
-15분마다 실행되며
+5분마다 실행되며
   · 매번: 텔레그램 명령 처리 ("OO 알림 해줘" / "OO 알림 꺼줘" / "키워드 목록")
   · 3시간마다(새벽 3~6시 제외): 새 핫딜 확인 → 키워드에 맞는 딜만 메시지 1개로 묶어 전송
 키워드는 keywords.json 에 저장되고, 변경되면 워크플로가 저장소에 자동 커밋합니다.
@@ -69,16 +69,31 @@ def save_keywords(kws):
 
 
 # ───────────────────────── 수집 ─────────────────────────
-def paginate(fetch_page, seen, max_pages):
-    """이미 본 글이 나올 때까지(또는 최대 페이지까지) 여러 페이지를 넘겨 수집"""
+def paginate(fetch_page, seen, max_pages, delay):
+    """이미 본 글이 나올 때까지(또는 최대 페이지까지) 여러 페이지를 넘겨 수집.
+    중간 페이지에서 실패하면 그때까지 모은 글과 오류를 함께 돌려줌"""
     items = []
     for page in range(1, max_pages + 1):
-        got = fetch_page(page)
+        try:
+            got = fetch_page(page)
+        except Exception as e:
+            if not items:
+                raise
+            return items, e
         items += got
         if not seen or any(it["id"] in seen for it in got):
             break
-        time.sleep(2)
-    return items
+        time.sleep(delay)
+    return items, None
+
+
+def retry_after(e):
+    """430/429 응답의 Retry-After(초). 없으면 30분"""
+    resp = getattr(e, "response", None)
+    try:
+        return max(int(resp.headers.get("Retry-After", "")), 300)
+    except (AttributeError, ValueError):
+        return 1800
 
 
 def fetch_fmkorea_page(page):
@@ -258,7 +273,7 @@ HELP = ("🛒 <b>핫딜 알리미 사용법</b>\n"
         "• <code>단백질 알림 해줘</code> → 키워드 추가 (프로틴 등 연관어 자동 포함)\n"
         "• <code>단백질 알림 꺼줘</code> → 키워드 삭제\n"
         "• <code>키워드 목록</code> → 현재 목록 보기\n"
-        "딜 확인은 3시간마다, 명령은 15분 안에 반영됩니다.")
+        "딜 확인은 3시간마다, 명령은 5분 안에 반영됩니다.")
 
 
 def handle_commands(state, kws):
@@ -295,7 +310,7 @@ def handle_commands(state, kws):
             if added:
                 changed = True
                 reply = "✅ 알림 키워드 추가\n" + "\n".join(fmt_kw(k) for k in added)
-                hits = quick_search(added)
+                hits = quick_search(added, state)
                 if hits:
                     reply += "\n\n지금 올라와 있는 관련 딜\n" + "\n".join(hits)
             else:
@@ -319,15 +334,18 @@ def handle_commands(state, kws):
     return changed
 
 
-def quick_search(new_kws):
-    """방금 추가한 키워드로 최신 1페이지를 바로 검색"""
+def quick_search(new_kws, state):
+    """방금 추가한 키워드로 최신 1페이지를 바로 검색 (접속 제한 중인 사이트는 건너뜀)"""
     lines = []
-    for fn in (fetch_fmkorea_page, fetch_ppomppu_page):
+    for name, (fn, _, _) in SOURCES.items():
+        if is_blocked(state, name):
+            continue
         try:
             for it in fn(1):
                 if not it["ended"] and match_keyword(it["title"], new_kws):
                     lines.append(f'• <a href="{html.escape(it["url"])}">{html.escape(it["title"])}</a>')
         except Exception as e:
+            state.setdefault("blocked_until", {})[name] = time.time() + retry_after(e)
             log("⚠️ 즉시 검색 실패:", e)
     return lines[:8]
 
@@ -383,24 +401,50 @@ def scan_slot(now):
     return None if slot == 1 else now.strftime("%Y%m%d-") + str(slot)
 
 
-def scan_deals(state, kws):
+# 사이트별 (수집 함수, 최대 페이지, 페이지 사이 대기초). 펨코는 보안 시스템이 잦은 요청을 막으므로 천천히
+SOURCES = {"fmkorea": (fetch_fmkorea_page, 3, 10), "ppomppu": (fetch_ppomppu_page, 8, 2)}
+LABEL = {"fmkorea": "에펨코리아", "ppomppu": "뽐뿌"}
+
+
+def is_blocked(state, name):
+    return time.time() < state.get("blocked_until", {}).get(name, 0)
+
+
+def scan_deals(state, kws, names):
+    """names 사이트들의 새 글을 확인. 막힌 사이트는 pending으로 남겨 차단이 풀린 뒤 다음 실행에서 다시 시도"""
     seen = set(state.get("seen", []))
     fetched = []
-    for name, fn, pages in (("fmkorea", fetch_fmkorea_page, 5), ("ppomppu", fetch_ppomppu_page, 8)):
-        if not CONFIG.get("sources", {}).get(name, True):
+    pending = state.setdefault("pending", {})
+    for name in names:
+        fn, pages, delay = SOURCES[name]
+        if is_blocked(state, name):
+            pending[name] = True
+            log(f"{name}: 접속 제한 중이라 나중에 다시 시도")
             continue
         try:
-            got = paginate(fn, seen, pages)
+            got, err = paginate(fn, seen, pages, delay)
+        except Exception as e:
+            got, err = [], e
+        if got:
             log(f"{name}: {len(got)}건 수집")
             fetched += got
+        if err is None:
+            pending.pop(name, None)
             state.setdefault("fail", {})[name] = 0
-        except Exception as e:
-            n = state.setdefault("fail", {}).get(name, 0) + 1
-            state["fail"][name] = n
-            log(f"⚠️ {name} 수집 실패 ({n}회 연속): {e}")
-            if n == 3 and state.get("chat_id"):
-                label = {"fmkorea": "에펨코리아", "ppomppu": "뽐뿌"}[name]
-                send(state["chat_id"], f"⚠️ {label} 접속이 연속 3번 실패했어요. 사이트가 서버 접속을 막았을 수 있습니다.")
+            continue
+        # 실패: 차단 시간을 기록하고 풀리면 다시 시도 (Retry-After 준수, 재시도로 몰아붙이지 않음)
+        wait = retry_after(err)
+        state.setdefault("blocked_until", {})[name] = time.time() + wait
+        pending[name] = True
+        n = state.setdefault("fail", {}).get(name, 0) + 1
+        state["fail"][name] = n
+        log(f"⚠️ {name} 수집 실패 ({n}회 연속, {wait // 60}분 뒤 재시도): {err}")
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        warned = state.setdefault("warned", {})
+        if n >= 6 and warned.get(name) != today and state.get("chat_id"):   # 하루 1번만 알림
+            warned[name] = today
+            send(state["chat_id"], f"⚠️ {LABEL[name]} 보안 시스템이 자동 접속을 계속 막고 있어요. "
+                                   f"막힌 동안의 {LABEL[name]} 딜은 알림이 늦거나 빠질 수 있습니다.")
 
     new_items = [it for it in fetched if it["id"] not in seen]
     log(f"새 글 {len(new_items)}건")
@@ -446,11 +490,16 @@ def main():
     if is_new and state.get("chat_id"):
         send(state["chat_id"], "✅ <b>핫딜 알리미 연결 완료</b>\n등록된 키워드에 맞는 딜만 3시간마다 묶어서 보내드릴게요.")
 
+    enabled = [n for n in SOURCES if CONFIG.get("sources", {}).get(n, True)]
     slot = scan_slot(datetime.now(KST))
+    retry = [n for n in enabled if state.get("pending", {}).get(n) and not is_blocked(state, n)]
     if FORCE_SCAN or (slot and slot != state.get("last_slot")):
-        scan_deals(state, kws)
+        scan_deals(state, kws, enabled)
         if slot:
             state["last_slot"] = slot
+    elif retry:
+        log(f"차단이 풀린 사이트 다시 확인: {', '.join(retry)}")
+        scan_deals(state, kws, retry)
     else:
         log("이번 실행은 명령만 처리 (딜 확인은 3시간 단위)")
     save_state(state)
