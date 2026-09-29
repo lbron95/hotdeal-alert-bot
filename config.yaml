@@ -12,7 +12,7 @@ sources:
   ppomppu: true   # 뽐뿌게시판
 
 # 제목에 들어 있으면 어떤 키워드든 무조건 제외
-exclude_keywords: [품절, 삽니다, 구합니다]
+exclude_keywords: [품절, 삽니다, 구합니다, 강아지, 고양이, 반려견, 반려묘, 애견, 사료, 덴탈껌]
 
 # 명령 해석·연관어 생성에 쓰는 Gemini 모델 (앞에서부터 시도)
 ai:
