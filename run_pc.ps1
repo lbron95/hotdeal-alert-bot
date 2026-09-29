@@ -1,4 +1,4 @@
-# Run the hotdeal bot once on this PC (Task Scheduler calls this every 15 minutes).
+# Run the hotdeal bot once on this PC (Task Scheduler calls this every 5 minutes).
 # Token and key live only in the .env file next to this script (git-ignored).
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
