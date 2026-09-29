@@ -22,6 +22,7 @@ popular:
   enabled: true
   max_age_hours: 8
   bargain_ratio: 0.85        # 단가 기준보다 이만큼(15%) 더 싸면 ⚡ 즉시 알림
+  history_bargain_ratio: 0.8 # 최근 30일 가격 이력의 중간값보다 20% 이상 싸면 ⚡ 즉시 알림 (이력 5건 이상일 때)
   fmkorea: {votes: 30, comments: 60, pages: 2}   # pages: 인기 갱신을 위해 매번 볼 페이지 수
   ppomppu: {votes: 8, comments: 30, pages: 3}
 

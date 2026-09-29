@@ -319,6 +319,55 @@ def price_check(it, kw):
     return "", True, False
 
 
+# ───────────────────────── 가격 이력 ─────────────────────────
+def hist_key(kw, ups):
+    """키워드별로 비교할 단가 단위 (수동 기준이 있으면 그 단위, 없으면 용량·무게 우선)"""
+    base = kw.get("max_unit_price")
+    if base:
+        k = unit_key(base["unit"])
+        return k if k in ups else None
+    return next((k for k in ("100ml", "100g", "개") if k in ups), None)
+
+
+def record_price(state, kw, it):
+    """이 키워드로 본 딜의 단가를 기록 (60일, 키워드당 최대 300건)"""
+    ups = unit_prices(it)
+    k = hist_key(kw, ups)
+    if not k:
+        return
+    hist = state.setdefault("prices", {}).setdefault(kw["word"], [])
+    if any(x["id"] == it["id"] for x in hist):
+        return
+    hist.append({"id": it["id"], "u": k, "v": round(ups[k], 1), "t": time.time()})
+    cutoff = time.time() - 60 * 86400
+    state["prices"][kw["word"]] = [x for x in hist if x["t"] > cutoff][-300:]
+
+
+def history_note(state, kw, it):
+    """최근 30일 같은 키워드 단가와 비교 → (한 줄 설명, 평소보다 훨씬 싼지)"""
+    ups = unit_prices(it)
+    k = hist_key(kw, ups)
+    if not k:
+        return "", False
+    v = ups[k]
+    cutoff = time.time() - 30 * 86400
+    past = sorted(x["v"] for x in state.get("prices", {}).get(kw["word"], [])
+                  if x["u"] == k and x["id"] != it["id"] and x["t"] > cutoff)
+    if len(past) < 5:                      # 비교할 이력이 쌓일 때까지는 표시 안 함
+        return "", False
+    med = past[len(past) // 2]
+    diff = (v - med) / med * 100
+    if v <= past[0]:
+        note = "🏆 30일 최저 단가" + (f" (평소보다 {-diff:.0f}%↓)" if diff <= -1 else "")
+    elif diff <= -10:
+        note = f"📉 평소보다 {-diff:.0f}% 저렴"
+    elif diff >= 10:
+        note = f"📈 평소보다 {diff:.0f}% 비쌈"
+    else:
+        note = "평소 수준 가격"
+    return note, v <= med * POP.get("history_bargain_ratio", 0.8)
+
+
 # ───────────────────────── 중복 딜 묶기 ─────────────────────────
 def sig(title):
     """쇼핑몰 [..]·가격 (..)을 뺀 제목의 2글자 조각 집합 (띄어쓰기가 달라도 비교되도록)"""
@@ -680,19 +729,21 @@ def tg(method, **params):
 
 
 def send(chat_id, text, buttons=None):
+    """전송 후 Telegram 메시지 객체를 돌려줌 (실패하면 None)"""
     try:
         extra = {"reply_markup": {"inline_keyboard": buttons}} if buttons else {}
-        tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-           link_preview_options={"is_disabled": True}, **extra)
+        return tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+                  link_preview_options={"is_disabled": True}, **extra)
     except Exception as e:
         log("⚠️ 전송 실패:", e)
+        return None
 
 
 def fmt_group(group, n, note=""):
-    """같은 상품 묶음 1개 → 알림 항목 텍스트"""
+    """같은 상품 묶음 1개 → (제목 줄, 나머지 줄) 알림 항목 텍스트"""
     e = html.escape
     it, info = group[0]
-    meta = " · ".join(x for x in [it["price"], it["delivery"], info.get("unit", "")] if x)
+    meta = " · ".join(x for x in [it["price"], it["delivery"], info.get("unit", ""), info.get("hist", "")] if x)
     stats = ""
     if it["votes"] not in ("", "0") or it["comments"] not in ("", "0"):
         stats = f"  👍{it['votes']} 💬{it['comments']}"
@@ -702,24 +753,34 @@ def fmt_group(group, n, note=""):
     line2 = "   " + " · ".join(x for x in [tag, e(meta)] if x) + stats + f" · {links}"
     if note:
         line2 += f"\n   💬 {e(note)}"
-    return f"{head}\n{line2}"
+    return head, line2
+
+
+def render(msg):
+    """저장해 둔 알림 메시지를 다시 그림 (종료된 딜은 취소선 + ⛔)"""
+    out = msg["head"]
+    for b in msg["blocks"]:
+        out += (f"\n<s>{b['line1']}</s> ⛔종료\n{b['rest']}\n" if b.get("ended")
+                else f"\n{b['line1']}\n{b['rest']}\n")
+    return out
 
 
 def send_alert(state, title, entries, kind, notes=None):
-    """entries: [(item, info)] → 같은 상품끼리 묶어 👍/👎 버튼과 함께 전송. info={'word','unit'}"""
+    """entries: [(item, info)] → 같은 상품끼리 묶어 👍/👎 버튼과 함께 전송. info={'word','unit','hist'}"""
     if not entries or not state.get("chat_id"):
         return
     groups = group_similar(entries)
-    msgs, cur, btns, row = [], f"{title} {len(groups)}건\n", [], []
+    msgs, cur, btns, row = [], {"head": f"{title} {len(groups)}건\n", "blocks": []}, [], []
     for n, g in enumerate(groups, 1):
         it = g[0][0]
-        block = "\n" + fmt_group(g, n, (notes or {}).get(it["id"], "")) + "\n"
-        if len(cur) + len(block) > 3800 or len(btns) >= 20:
+        line1, rest = fmt_group(g, n, (notes or {}).get(it["id"], ""))
+        block = {"ids": [x["id"] for x, _ in g], "line1": line1, "rest": rest}
+        if len(render(cur)) + len(line1) + len(rest) > 3700 or len(btns) >= 20:
             if row:
                 btns.append(row)
             msgs.append((cur, btns))
-            cur, btns, row = "", [], []
-        cur += block
+            cur, btns, row = {"head": "", "blocks": []}, [], []
+        cur["blocks"].append(block)
         row += [{"text": f"{n} 👍", "callback_data": f"up|{it['id']}"},
                 {"text": f"{n} 👎", "callback_data": f"dn|{it['id']}"}]
         if len(row) == 4:
@@ -732,8 +793,28 @@ def send_alert(state, title, entries, kind, notes=None):
     if row:
         btns.append(row)
     msgs.append((cur, btns))
-    for text, b in msgs:
-        send(state["chat_id"], text, b)
+    for m, b in msgs:
+        res = send(state["chat_id"], render(m), b)
+        if res and res.get("message_id"):     # 종료 표시를 위해 24시간 보관
+            state.setdefault("msgs", []).append({**m, "mid": res["message_id"], "buttons": b, "t": time.time()})
+    state["msgs"] = [m for m in state.get("msgs", []) if time.time() - m["t"] < 24 * 3600]
+
+
+def mark_ended(state, ended_ids):
+    """보낸 알림 속 딜이 종료되면 그 메시지를 수정해 취소선 표시"""
+    for m in state.get("msgs", []):
+        hit = [b for b in m["blocks"] if not b.get("ended") and set(b["ids"]) & ended_ids]
+        if not hit:
+            continue
+        for b in hit:
+            b["ended"] = True
+        try:
+            extra = {"reply_markup": {"inline_keyboard": m["buttons"]}} if m.get("buttons") else {}
+            tg("editMessageText", chat_id=state["chat_id"], message_id=m["mid"], text=render(m),
+               parse_mode="HTML", link_preview_options={"is_disabled": True}, **extra)
+            log(f"종료 표시: {len(hit)}건 (메시지 {m['mid']})")
+        except Exception as e:
+            log("⚠️ 종료 표시 실패:", e)
 
 
 # ───────────────────────── 딜 확인 ─────────────────────────
@@ -811,6 +892,7 @@ def collect(state, data, names):
             watch[it["id"]] = {**it, "first": now, "done": init_watch and is_popular(it)}
     max_age = POP.get("max_age_hours", 8) * 3600
     state["watch"] = watch = {k: v for k, v in watch.items() if now - v["first"] < max_age}
+    mark_ended(state, {it["id"] for it in fetched if it["ended"]})
 
     if first_run:
         log("첫 실행: 기존 글은 기록만 함")
@@ -830,12 +912,17 @@ def collect(state, data, names):
             continue
         if recently_alerted(state, it["title"], "kw"):
             continue
-        info = {"word": kw["word"], "unit": unit}
-        if kw.get("urgent") or bargain:
+        hist, cheap = history_note(state, kw, it)
+        info = {"word": kw["word"], "unit": unit, "hist": hist}
+        if kw.get("urgent") or bargain or cheap:
             urgent.append((it, info))
         else:
             state.setdefault("queue", []).append({"item": it, "info": info})
             queued += 1
+    for it in fetched:                     # 가격 이력: 본 딜의 단가를 모두 기록 (종료 딜도 시세 참고용)
+        m = match_keyword(it["title"], kws)
+        if m:
+            record_price(state, m[0], it)
     log(f"즉시 알림 {len(urgent)}건, 묶음 대기 {queued}건")
     send_alert(state, "⚡ <b>바로 확인할 딜</b> —", urgent, "kw")
 
@@ -852,14 +939,19 @@ def collect(state, data, names):
                 continue
             if recently_alerted(state, w["title"], "pop"):
                 continue
-            unit, _, _ = price_check(w, (match_keyword(w["title"], kws) or [None])[0])
-            hot.append({**w, "_age": max(1, round((now - w["first"]) / 3600)), "_unit": unit})
+            kw = (match_keyword(w["title"], kws) or [None])[0]
+            unit, _, _ = price_check(w, kw)
+            hist = history_note(state, kw, w)[0] if kw else ""
+            hot.append({**w, "_age": max(1, round((now - w["first"]) / 3600)), "_unit": unit,
+                        "_word": kw["word"] if kw else None, "_hist": hist})
         log(f"인기 딜 {len(hot)}건")
+        resumed = state.pop("resumed_hours", None)
         if hot:
             reasons = popular_reasons(hot)
-            entries = [(h, {"word": (match_keyword(h["title"], kws) or [{}])[0].get("word"), "unit": h["_unit"]})
-                       for h in hot]
-            send_alert(state, "🔥 <b>지금 인기 딜</b> —", entries, "pop", reasons)
+            entries = [(h, {"word": h["_word"], "unit": h["_unit"], "hist": h["_hist"]}) for h in hot]
+            title = (f"💤 <b>{resumed}시간 쉬는 동안 인기였던 딜</b> —" if resumed
+                     else "🔥 <b>지금 인기 딜</b> —")
+            send_alert(state, title, entries, "pop", reasons)
 
 
 def send_digest(state):
@@ -895,6 +987,11 @@ def main():
     if is_new and state.get("chat_id"):
         send(state["chat_id"], "✅ <b>핫딜 알리미 연결 완료</b>\n등록된 키워드에 맞는 딜은 3시간마다 묶어서, 급한 딜과 인기 딜은 바로 보내드릴게요.")
 
+    gap = time.time() - state.get("last_run", time.time())
+    if gap > 2 * 3600:                     # PC가 꺼져 있었음 → 다음 수집의 인기 딜을 '쉬는 동안' 요약으로 표시
+        state["resumed_hours"] = round(gap / 3600)
+        log(f"{gap / 3600:.1f}시간 만에 실행됨")
+
     now = datetime.now(KST)
     enabled = [n for n in SOURCES if CONFIG.get("sources", {}).get(n, True)]
     night = now.hour // 3 == 1
@@ -913,8 +1010,34 @@ def main():
     if slot and slot != state.get("last_slot"):
         send_digest(state)
         state["last_slot"] = slot
+    state["last_run"] = time.time()
+    state["errors"] = 0
     save_state(state)
 
 
+def report_error(err):
+    """실행이 계속 실패하면(30분 이상) 하루 1번 텔레그램으로 알림"""
+    try:
+        state = load_state()
+        state["errors"] = n = state.get("errors", 0) + 1
+        state["last_run"] = time.time()
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        if n >= 6 and state.get("err_warned") != today and state.get("chat_id") and BOT_TOKEN:
+            state["err_warned"] = today
+            send(state["chat_id"], f"⚠️ <b>핫딜 알리미 오류</b>\n{n}번 연속 실행에 실패했어요. "
+                                   f"PC의 logs 폴더를 확인해 주세요.\n<code>{html.escape(str(err))[:300]}</code>")
+        save_state(state)
+    except Exception as e:
+        log("⚠️ 오류 기록 실패:", e)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as err:
+        import traceback
+        traceback.print_exc()
+        report_error(err)
+        sys.exit(1)
