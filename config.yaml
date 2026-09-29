@@ -14,6 +14,17 @@ sources:
 # 제목에 들어 있으면 어떤 키워드든 무조건 제외
 exclude_keywords: [품절, 삽니다, 구합니다, 강아지, 고양이, 반려견, 반려묘, 애견, 사료, 덴탈껌]
 
+# 새 글 수집 간격(분). 키워드 딜은 모아서 3시간마다, ⚡·🔥 딜은 수집 즉시 알림
+collect_minutes: 30
+
+# 🔥 인기 딜: 키워드와 상관없이 올라온 지 max_age_hours 안에 추천(votes)이나 댓글(comments)이 기준을 넘으면 알림
+popular:
+  enabled: true
+  max_age_hours: 8
+  bargain_ratio: 0.85        # 단가 기준보다 이만큼(15%) 더 싸면 ⚡ 즉시 알림
+  fmkorea: {votes: 30, comments: 60, pages: 2}   # pages: 인기 갱신을 위해 매번 볼 페이지 수
+  ppomppu: {votes: 8, comments: 30, pages: 3}
+
 # 명령 해석·연관어 생성에 쓰는 Gemini 모델 (앞에서부터 시도)
 ai:
   models: [gemini-3.5-flash, gemini-3.1-flash-lite, gemini-2.5-flash]

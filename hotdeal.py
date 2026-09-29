@@ -1,10 +1,13 @@
 """
-핫딜 알리미 — 에펨코리아·뽐뿌 새 핫딜 중 '내 키워드'에 맞는 글만 텔레그램으로 보내줍니다.
+핫딜 알리미 — 에펨코리아·뽐뿌 핫딜 중 '내 키워드'에 맞는 글과 인기 딜을 텔레그램으로 보내줍니다.
 
 5분마다 실행되며
-  · 매번: 텔레그램 명령 처리 ("OO 알림 해줘" / "OO 알림 꺼줘" / "키워드 목록")
-  · 3시간마다(새벽 3~6시 제외): 새 핫딜 확인 → 키워드에 맞는 딜만 메시지 1개로 묶어 전송
-키워드는 keywords.json 에 저장되고, 변경되면 워크플로가 저장소에 자동 커밋합니다.
+  · 매번: 텔레그램 명령·버튼(👍/👎) 처리
+  · 30분마다(새벽 3~6시 제외): 새 글 수집
+      - ⚡ 급한 키워드 / 기준 단가보다 훨씬 싼 딜 → 즉시 알림
+      - 🔥 키워드와 상관없이 추천·댓글이 빠르게 붙은 인기 딜 → 이유 한 줄과 함께 즉시 알림
+      - 나머지 키워드 딜 → 모아뒀다가 3시간마다 메시지 1개로 묶어 전송
+키워드는 keywords.json 에 저장됩니다.
 """
 import html
 import json
@@ -35,6 +38,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 HEADERS = {"User-Agent": UA, "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 SEEN_LIMIT = 4000
+POP = CONFIG.get("popular", {})
 
 
 def log(*a):
@@ -53,24 +57,30 @@ def load_state():
 
 def save_state(state):
     state["seen"] = state.get("seen", [])[-SEEN_LIMIT:]
+    cutoff = time.time() - 48 * 3600
+    state["alerted"] = {k: v for k, v in state.get("alerted", {}).items() if v.get("t", 0) > cutoff}
     STATE_FILE.parent.mkdir(exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
 def load_keywords():
+    """keywords.json 전체 (keywords 목록 + pop_exclude 등)"""
     if KEYWORDS_FILE.exists():
-        return json.loads(KEYWORDS_FILE.read_text(encoding="utf-8")).get("keywords", [])
-    return []
+        data = json.loads(KEYWORDS_FILE.read_text(encoding="utf-8"))
+    else:
+        data = {}
+    data.setdefault("keywords", [])
+    data.setdefault("pop_exclude", [])
+    return data
 
 
-def save_keywords(kws):
-    KEYWORDS_FILE.write_text(json.dumps({"keywords": kws}, ensure_ascii=False, indent=2) + "\n",
-                             encoding="utf-8")
+def save_keywords(data):
+    KEYWORDS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 # ───────────────────────── 수집 ─────────────────────────
-def paginate(fetch_page, seen, max_pages, delay):
-    """이미 본 글이 나올 때까지(또는 최대 페이지까지) 여러 페이지를 넘겨 수집.
+def paginate(fetch_page, seen, max_pages, delay, min_pages=1):
+    """이미 본 글이 나올 때까지(최소 min_pages, 최대 max_pages) 페이지를 넘겨 수집.
     중간 페이지에서 실패하면 그때까지 모은 글과 오류를 함께 돌려줌"""
     items = []
     for page in range(1, max_pages + 1):
@@ -81,7 +91,7 @@ def paginate(fetch_page, seen, max_pages, delay):
                 raise
             return items, e
         items += got
-        if not seen or any(it["id"] in seen for it in got):
+        if page >= min_pages and (not seen or any(it["id"] in seen for it in got)):
             break
         time.sleep(delay)
     return items, None
@@ -173,13 +183,21 @@ def fetch_ppomppu_page(page):
         raise RuntimeError("목록을 찾지 못함 (차단 또는 구조 변경)")
     return items
 
+
 # ───────────────────────── 매칭 ─────────────────────────
 def norm(s):
     return re.sub(r"\s+", "", str(s)).lower()
 
 
+def num(s):
+    try:
+        return int(re.sub(r"[^\d]", "", str(s)) or 0)
+    except ValueError:
+        return 0
+
+
 def match_keyword(title, kws):
-    """제목에 맞는 키워드 항목을 반환 (없으면 None)"""
+    """제목에 맞는 키워드 항목과 걸린 단어를 반환 (없으면 None)"""
     t = norm(title)
     if any(norm(x) in t for x in CONFIG.get("exclude_keywords", [])):
         return None
@@ -188,13 +206,151 @@ def match_keyword(title, kws):
         hit = next((w for w in words if norm(w) and norm(w) in t), None)
         if not hit:
             continue
-        if any(norm(x) in t for x in kw.get("exclude", []) if norm(x)):
+        if kw_excludes(title, kw):
             continue
         need = kw.get("require_any", [])
         if need and not any(norm(x) in t for x in need):
             continue
         return kw, hit
     return None
+
+
+def kw_excludes(title, kw):
+    """키워드의 제외어(exclude)나 제외 패턴(exclude_regex)에 걸리면 True"""
+    t = norm(title)
+    if any(norm(x) in t for x in kw.get("exclude", []) if norm(x)):
+        return True
+    return any(re.search(p, title) for p in kw.get("exclude_regex", []))
+
+
+def blocked_by_keyword(title, kws):
+    """키워드 단어는 들어 있지만 그 키워드의 제외 규칙에 걸리는 글 (인기 딜에서도 빼기 위함)"""
+    t = norm(title)
+    for kw in kws:
+        if any(re.search(p, title) for p in kw.get("exclude_regex", [])):
+            return True      # 패턴(지방 출발 항공권 등)은 키워드 단어가 없어도 적용
+        if any(norm(w) and norm(w) in t for w in [kw["word"]] + kw.get("aliases", [])) and kw_excludes(title, kw):
+            return True
+    return False
+
+
+# ───────────────────────── 단위가격 ─────────────────────────
+COUNT_UNITS = "개입|개|구|캔|팩|병|입|봉|포|컵|매|롤|장|알"
+SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(kg|g|ml|l)(?![a-z])", re.I)
+COUNT_RE = re.compile(rf"(\d+)\s*({COUNT_UNITS})(?![가-힣])")
+
+
+def parse_price(it):
+    """판매가(원). 펨코는 가격 칸, 뽐뿌는 제목 괄호 안 '(14,500원/무료)'"""
+    src = it.get("price") or ""
+    m = (re.search(r"([\d,]{3,})\s*원", src) or re.search(r"\(([^)]*?)([\d,]{3,})\s*원", it["title"])
+         or re.search(r"\(([^)]*?)(\d{1,3}(?:,\d{3})+)\s*/", it["title"]))       # '(22,900/무료)'
+    if not m:
+        return None
+    p = num(m.group(m.lastindex))
+    return p if p >= 100 else None
+
+
+def parse_quantity(title):
+    """제목에서 총 수량 추출 → {'count': 개수, 'ml': 총 용량, 'g': 총 무게}. 옵션이 여러 개(1kg/2kg)면 None"""
+    t = re.sub(r"\([^)]*원[^)]*\)", " ", title)          # 가격 괄호 제거
+    if re.search(r"\d\s*(kg|g|ml|l|개|구|팩|캔)\s*/\s*\d", t, re.I):
+        return None                                        # 옵션별 수량이 달라 계산 불가
+    total = {"count": 0, "ml": 0.0, "g": 0.0}
+    # '190ml 30캔', '250ml*24개', '1kg x 2개'처럼 [크기][개수] 쌍을 먼저 처리
+    for m in re.finditer(rf"(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\s*[x×*,]?\s*(\d+)\s*({COUNT_UNITS})(?![가-힣])", t, re.I):
+        size, unit, cnt = float(m.group(1)), m.group(2).lower(), int(m.group(3))
+        key, mult = {"kg": ("g", 1000), "g": ("g", 1), "l": ("ml", 1000), "ml": ("ml", 1)}[unit]
+        total[key] += size * mult * cnt
+        total["count"] += cnt
+    t2 = re.sub(rf"(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\s*[x×*,]?\s*(\d+)\s*({COUNT_UNITS})(?![가-힣])", " ", t, flags=re.I)
+    counts = [int(m.group(1)) for m in COUNT_RE.finditer(t2)]
+    sizes = [(float(m.group(1)), m.group(2).lower()) for m in SIZE_RE.finditer(t2)]
+    if counts:
+        total["count"] += sum(counts)
+    if sizes and not total["ml"] and not total["g"]:
+        size, unit = sizes[0]
+        key, mult = {"kg": ("g", 1000), "g": ("g", 1), "l": ("ml", 1000), "ml": ("ml", 1)}[unit]
+        total[key] = size * mult * (sum(counts) if counts else 1)
+    return total if any(total.values()) else None
+
+
+def unit_prices(it):
+    """{'개': 원, '100ml': 원, '100g': 원, 'kg': 원, 'L': 원} 중 계산 가능한 것"""
+    price, q = parse_price(it), parse_quantity(it["title"])
+    if not price or not q:
+        return {}
+    out = {}
+    if q["count"]:
+        out["개"] = price / q["count"]
+    if q["ml"]:
+        out["100ml"] = price / q["ml"] * 100
+        out["L"] = price / q["ml"] * 1000
+    if q["g"]:
+        out["100g"] = price / q["g"] * 100
+        out["kg"] = price / q["g"] * 1000
+    return out
+
+
+COUNT_ALIASES = {"구", "개", "캔", "팩", "병", "입", "봉", "포", "컵", "개입", "알"}
+
+
+def unit_key(u):
+    u = str(u).strip()
+    return "개" if u in COUNT_ALIASES else {"ml": "100ml", "100ml": "100ml", "g": "100g", "100g": "100g",
+                                            "kg": "kg", "l": "L", "L": "L"}.get(u, u)
+
+
+def price_check(it, kw):
+    """(단가 표시 문자열, 통과여부, 역대급여부)"""
+    ups = unit_prices(it)
+    base = kw.get("max_unit_price") if kw else None
+    if base:
+        key = unit_key(base["unit"])
+        if key in ups:
+            v = ups[key]
+            label = f"{base['unit']}당 {v:,.0f}원 (기준 {base['max']:,}원)"
+            ratio = POP.get("bargain_ratio", 0.85)
+            return label, v <= base["max"], v <= base["max"] * ratio
+        return "", True, False       # 단가를 못 구하면 놓치지 않도록 통과
+    for key in ("개", "100ml", "100g"):
+        if key in ups:
+            return f"{key}당 {ups[key]:,.0f}원", True, False
+    return "", True, False
+
+
+# ───────────────────────── 중복 딜 묶기 ─────────────────────────
+def sig(title):
+    """쇼핑몰 [..]·가격 (..)을 뺀 제목의 2글자 조각 집합 (띄어쓰기가 달라도 비교되도록)"""
+    t = re.sub(r"\[[^\]]*\]|\([^)]*원[^)]*\)", "", title.lower())
+    t = "".join(re.findall(r"[가-힣a-z0-9]", t))
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def similar(a, b):
+    """짧은 쪽 제목의 75% 이상이 겹치면 같은 상품"""
+    if len(a) < 4 or len(b) < 4:
+        return False
+    return len(a & b) / min(len(a), len(b)) >= 0.75
+
+
+def group_similar(entries):
+    """[(item, extra)] → [[(item, extra), ...], ...] 같은 상품끼리 묶음"""
+    groups = []
+    for e in entries:
+        s = sig(e[0]["title"])
+        for g in groups:
+            if similar(s, g[0]):
+                g[1].append(e)
+                break
+        else:
+            groups.append((s, [e]))
+    return [g[1] for g in groups]
+
+
+def recently_alerted(state, title, kind):
+    s = sig(title)
+    return any(v.get("kind") == kind and similar(s, set(v.get("sig", []))) for v in state.get("alerted", {}).values())
 
 
 # ───────────────────────── Gemini ─────────────────────────
@@ -239,11 +395,19 @@ def parse_command(text, kws):
             prompt = (
                 "너는 핫딜 알림 봇의 명령 해석기야. 사용자의 메시지를 읽고 JSON으로만 답해.\n"
                 f"현재 등록된 키워드: {current}\n\n"
-                "action 종류: add(알림 추가), remove(알림 끄기), list(목록 보기), help(사용법), none(명령 아님)\n"
-                "remove일 때 words에는 현재 등록된 키워드 중 해당하는 것을 정확히 적는다.\n"
+                "action 종류: add(알림 추가), remove(알림 끄기), list(목록 보기), help(사용법), "
+                "price(단가 기준 설정/해제), urgent(즉시 알림 켜기/끄기), none(명령 아님)\n"
+                "remove/price/urgent일 때 word(s)에는 현재 등록된 키워드 중 해당하는 것을 정확히 적는다.\n"
+                "price: '계란 1구 300원 이하만' → unit은 구/개/캔/팩/병/100ml/100g/kg/L 중 하나, max는 원 단위 정수. "
+                "'기준 없애줘'면 max는 null.\n"
+                "urgent: '러닝화는 바로 알려줘' → on:true, '묶어서 보내줘' → on:false.\n"
+                "unexclude(제외어 되돌리기): '제로콜라 제외어 210ml 빼줘' → word와 exclude. "
+                "인기 딜 제외를 되돌리면 word는 null.\n"
                 "add일 때:\n" + EXPAND_RULE +
                 '형식: {"action":"add","items":[{"word":"단백질","aliases":["프로틴"],"exclude":[],"require_any":[]}]}\n'
-                '      {"action":"remove","words":["단백질"]}  {"action":"list"}\n\n'
+                '      {"action":"remove","words":["단백질"]}  {"action":"list"}\n'
+                '      {"action":"price","word":"계란","unit":"구","max":300}  {"action":"urgent","word":"러닝화","on":true}\n'
+                '      {"action":"unexclude","word":"제로콜라","exclude":"210ml"}\n\n'
                 f"사용자 메시지: {text}"
             )
             return gemini_json(prompt)
@@ -255,6 +419,18 @@ def parse_command(text, kws):
         return {"action": "list"}
     if re.search(r"사용법|도움|help", t, re.I) or t.startswith("/start"):
         return {"action": "help"}
+    m = re.match(r"(.+?)\s*제외어\s*(.+?)\s*(?:을|를)?\s*(빼|삭제|취소|없애)", t)
+    if m:
+        return {"action": "unexclude", "word": m.group(1).strip(), "exclude": m.group(2).strip()}
+    m = re.match(r"(.+?)\s*1?\s*(구|개|캔|팩|병|100ml|100g|kg|L)\s*당?\s*([\d,]+)\s*원\s*이하", t)
+    if m:
+        return {"action": "price", "word": m.group(1).strip(), "unit": m.group(2), "max": num(m.group(3))}
+    m = re.match(r"(.+?)\s*(?:은|는)?\s*(즉시|바로)", t)
+    if m:
+        return {"action": "urgent", "word": m.group(1).strip(), "on": True}
+    m = re.match(r"(.+?)\s*(?:은|는)?\s*(묶어서|모아서)", t)
+    if m:
+        return {"action": "urgent", "word": m.group(1).strip(), "on": False}
     m = re.match(r"(.+?)\s*(?:관련\s*)?(?:알림|알람|키워드)?\s*(?:을|를)?\s*(꺼|끄|빼|삭제|그만|중지|제거)", t)
     if m:
         return {"action": "remove", "words": [w.strip() for w in re.split(r"[,/·]", m.group(1)) if w.strip()]}
@@ -264,24 +440,86 @@ def parse_command(text, kws):
     return {"action": "none"}
 
 
+def suggest_exclude(title, kw):
+    """👎 받은 딜에서 이 키워드의 제외어로 쓸 단어를 고름 (제목 안에 있는 단어만)"""
+    if GEMINI_KEY:
+        try:
+            ctx = f"키워드 '{kw['word']}'(연관어: {', '.join(kw.get('aliases', []))})" if kw else "인기 딜(키워드 없음)"
+            r = gemini_json(
+                "핫딜 알림 봇이 사용자에게 원치 않는 딜을 보냈어. 이런 딜이 다시 오지 않게 할 제외어 1개를 골라 JSON으로 답해.\n"
+                f"알림 기준: {ctx}\n딜 제목: {title}\n"
+                "규칙: 제외어는 반드시 제목에 그대로 들어 있는 짧은 단어(2~6자)이고, 사용자가 원하는 상품에는 잘 안 들어가는 단어여야 한다. "
+                "숫자·용량·수량(210ml, 30캔 등)·쇼핑몰 이름·키워드 자체나 그 연관어는 절대 고르지 않는다. "
+                "상품 종류·브랜드·용도처럼 '이런 건 싫다'를 나타내는 단어를 고른다. "
+                "인기 딜이면 상품 종류를 대표하는 단어(예: 항공권, 비데)를 고른다. 적당한 게 없으면 null.\n"
+                '형식: {"exclude":"비데","reason":"과일이 아니라 비데 제품"}')
+            w = str(r.get("exclude") or "").strip()
+            own = [kw["word"]] + kw.get("aliases", []) if kw else []
+            if (w and norm(w) in norm(title) and not re.search(r"\d", w)
+                    and not any(norm(w) in norm(o) or norm(o) in norm(w) for o in own)):
+                return w
+        except Exception as e:
+            log("⚠️ 제외어 추천 실패:", e)
+    return None
+
+
+def popular_reasons(items):
+    """인기 딜마다 인기 이유 한 줄"""
+    fallback = {it["id"]: f"올라온 지 {it['_age']}시간 만에 추천 {it['votes']}·댓글 {it['comments']}" for it in items}
+    if not GEMINI_KEY or not items:
+        return fallback
+    lines = "\n".join(
+        f"- id={it['id']} | {it['title']} | 가격 {it.get('price') or '-'} | 단가 {it.get('_unit') or '-'} | "
+        f"{it['_age']}시간 만에 추천 {it['votes']}·댓글 {it['comments']}" for it in items)
+    try:
+        r = gemini_json(
+            "아래는 한국 핫딜 커뮤니티에서 빠르게 인기를 얻은 딜이야. 각 딜이 왜 인기인지 한국어 한 줄(35자 이내)로 설명해.\n"
+            "가격·단가·구성(1+1, 증정)·브랜드·희소성 중 제목에서 알 수 있는 근거를 쓰고, 모르는 사실(역대가 등)은 단정하지 마. "
+            "근거가 부족하면 반응 속도를 언급해.\n"
+            f"{lines}\n\n"
+            '형식: {"reasons":{"fm:123":"한우 1등급이 kg당 5만원대, 평소보다 저렴"}}')
+        got = r.get("reasons", {})
+        return {k: str(got.get(k) or v)[:60] for k, v in fallback.items()}
+    except Exception as e:
+        log("⚠️ 인기 이유 생성 실패:", e)
+        return fallback
+
+
 def fmt_kw(k):
     extra = ", ".join(k.get("aliases", [])[:6])
-    return f"• <b>{html.escape(k['word'])}</b>" + (f"  <i>({html.escape(extra)})</i>" if extra else "")
+    flags = ""
+    if k.get("urgent"):
+        flags += " ⚡"
+    if k.get("max_unit_price"):
+        b = k["max_unit_price"]
+        flags += f" 💰{b['unit']}당 {b['max']:,}원↓"
+    return f"• <b>{html.escape(k['word'])}</b>{flags}" + (f"  <i>({html.escape(extra)})</i>" if extra else "")
 
 
 HELP = ("🛒 <b>핫딜 알리미 사용법</b>\n"
         "• <code>단백질 알림 해줘</code> → 키워드 추가 (프로틴 등 연관어 자동 포함)\n"
         "• <code>단백질 알림 꺼줘</code> → 키워드 삭제\n"
+        "• <code>러닝화는 바로 알려줘</code> → ⚡ 즉시 알림 (<code>묶어서 보내줘</code>로 해제)\n"
+        "• <code>계란 1구 300원 이하만</code> → 💰 단가 기준 (<code>계란 기준 없애줘</code>로 해제)\n"
         "• <code>키워드 목록</code> → 현재 목록 보기\n"
-        "딜 확인은 3시간마다, 명령은 5분 안에 반영됩니다.")
+        "• 알림의 👎 → 비슷한 딜이 다시 안 오게 제외어 자동 추가\n"
+        "키워드 딜은 3시간마다 묶어서, ⚡·🔥 인기 딜은 바로 보내드려요.")
 
 
-def handle_commands(state, kws):
-    """쌓인 텔레그램 메시지를 처리. 키워드가 바뀌면 True"""
+def find_kw(kws, word):
+    return next((k for k in kws if norm(k["word"]) == norm(word)), None)
+
+
+def handle_commands(state, data):
+    """쌓인 텔레그램 메시지와 버튼 입력을 처리. 키워드가 바뀌면 True"""
+    kws = data["keywords"]
     changed = False
     updates = tg("getUpdates", offset=state.get("tg_offset", 0), timeout=0)
     for upd in updates:
         state["tg_offset"] = upd["update_id"] + 1
+        if upd.get("callback_query"):
+            changed |= handle_button(state, data, upd["callback_query"])
+            continue
         msg = upd.get("message") or {}
         chat = msg.get("chat") or {}
         text = (msg.get("text") or "").strip()
@@ -300,11 +538,15 @@ def handle_commands(state, kws):
                 word = str(it.get("word", "")).strip()
                 if not word:
                     continue
+                old = find_kw(kws, word) or {}
                 entry = {"word": word,
                          "aliases": [a for a in it.get("aliases", []) if norm(a) != norm(word)],
                          "exclude": it.get("exclude", []),
                          "require_any": it.get("require_any", []),
                          "added": datetime.now(KST).strftime("%Y-%m-%d")}
+                for keep in ("urgent", "max_unit_price", "exclude_regex"):
+                    if keep in old:
+                        entry[keep] = old[keep]
                 kws[:] = [k for k in kws if norm(k["word"]) != norm(word)] + [entry]
                 added.append(entry)
             if added:
@@ -324,13 +566,88 @@ def handle_commands(state, kws):
                 reply = "🔕 알림 끔: " + ", ".join(html.escape(k["word"]) for k in gone)
             else:
                 reply = "등록된 키워드에서 찾지 못했어요. <code>키워드 목록</code>으로 확인해보세요."
+        elif act == "price":
+            kw = find_kw(kws, cmd.get("word", ""))
+            if not kw:
+                reply = "먼저 키워드를 등록해 주세요. 예: <code>계란 알림 해줘</code>"
+            elif cmd.get("max"):
+                kw["max_unit_price"] = {"unit": str(cmd.get("unit") or "개"), "max": num(cmd["max"])}
+                changed = True
+                reply = f"💰 {html.escape(kw['word'])}: {kw['max_unit_price']['unit']}당 {kw['max_unit_price']['max']:,}원 이하만 알려드릴게요.\n(기준보다 15% 이상 싸면 바로 알림)"
+            else:
+                kw.pop("max_unit_price", None)
+                changed = True
+                reply = f"💰 {html.escape(kw['word'])} 단가 기준을 없앴어요."
+        elif act == "urgent":
+            kw = find_kw(kws, cmd.get("word", ""))
+            if not kw:
+                reply = "먼저 키워드를 등록해 주세요."
+            else:
+                kw["urgent"] = bool(cmd.get("on", True))
+                changed = True
+                reply = (f"⚡ {html.escape(kw['word'])} 딜은 올라오면 바로 알려드릴게요." if kw["urgent"]
+                         else f"📦 {html.escape(kw['word'])} 딜은 3시간마다 묶어서 보내드릴게요.")
+        elif act == "unexclude":
+            w = str(cmd.get("exclude") or "").strip()
+            kw = find_kw(kws, cmd.get("word") or "")
+            pool = kw.get("exclude", []) if kw else data["pop_exclude"]
+            hit = next((x for x in pool if norm(x) == norm(w)), None)
+            if hit:
+                pool.remove(hit)
+                changed = True
+                reply = f"↩️ {html.escape(kw['word'] if kw else '인기 딜')} 제외어에서 <b>{html.escape(hit)}</b>를 뺐어요."
+            else:
+                reply = "그 제외어를 찾지 못했어요. <code>키워드 목록</code>으로 확인해보세요."
         elif act == "list":
             reply = (f"📋 <b>알림 키워드 {len(kws)}개</b>\n" + "\n".join(fmt_kw(k) for k in kws)) if kws else "등록된 키워드가 없어요."
+            if data.get("pop_exclude"):
+                reply += "\n\n🔥 인기 딜 제외: " + html.escape(", ".join(data["pop_exclude"]))
         elif act == "help":
             reply = HELP
         else:
             reply = "무슨 뜻인지 잘 모르겠어요.\n\n" + HELP
         send(state["chat_id"], reply)
+    return changed
+
+
+def handle_button(state, data, cq):
+    """👍/👎 버튼. 👎면 제외어를 자동으로 추가"""
+    chat = (cq.get("message") or {}).get("chat") or {}
+    if str(chat.get("id")) != str(state.get("chat_id")):
+        return False
+    act, _, item_id = str(cq.get("data", "")).partition("|")
+    rec = state.get("alerted", {}).get(item_id)
+    changed = False
+    if not rec:
+        toast = "오래된 알림이라 처리할 수 없어요"
+    elif act == "up":
+        state.setdefault("likes", []).append({"title": rec["title"], "word": rec.get("word"), "t": time.time()})
+        state["likes"] = state["likes"][-200:]
+        toast = "👍 기록했어요"
+    else:
+        kw = find_kw(data["keywords"], rec.get("word") or "")
+        w = suggest_exclude(rec["title"], kw)
+        if w and kw:
+            if w not in kw.setdefault("exclude", []):
+                kw["exclude"].append(w)
+                changed = True
+            toast = f"'{w}' 들어간 딜은 {kw['word']}에서 뺄게요"
+            send(state["chat_id"], f"🔕 <b>{html.escape(kw['word'])}</b> 제외어에 <b>{html.escape(w)}</b> 추가\n"
+                                   f"되돌리려면: <code>{html.escape(kw['word'])} 제외어 {html.escape(w)} 빼줘</code>")
+        elif w:
+            if w not in data["pop_exclude"]:
+                data["pop_exclude"].append(w)
+                changed = True
+            toast = f"'{w}' 인기 딜은 앞으로 안 보낼게요"
+            send(state["chat_id"], f"🔕 인기 딜 제외에 <b>{html.escape(w)}</b> 추가\n"
+                                   f"되돌리려면: <code>인기 딜 제외어 {html.escape(w)} 빼줘</code>")
+        else:
+            toast = "제외어를 못 찾았어요. 필요하면 키워드를 꺼주세요"
+        log(f"👎 {rec['title']} → {w}")
+    try:
+        tg("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
+    except Exception as e:
+        log("⚠️ 버튼 응답 실패:", e)
     return changed
 
 
@@ -362,36 +679,61 @@ def tg(method, **params):
     return data["result"]
 
 
-def send(chat_id, text):
+def send(chat_id, text, buttons=None):
     try:
+        extra = {"reply_markup": {"inline_keyboard": buttons}} if buttons else {}
         tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-           link_preview_options={"is_disabled": True})
+           link_preview_options={"is_disabled": True}, **extra)
     except Exception as e:
         log("⚠️ 전송 실패:", e)
 
 
-def fmt(it, hit, n):
+def fmt_group(group, n, note=""):
+    """같은 상품 묶음 1개 → 알림 항목 텍스트"""
     e = html.escape
-    meta = " · ".join(x for x in [it["price"], it["delivery"]] if x)
+    it, info = group[0]
+    meta = " · ".join(x for x in [it["price"], it["delivery"], info.get("unit", "")] if x)
     stats = ""
     if it["votes"] not in ("", "0") or it["comments"] not in ("", "0"):
         stats = f"  👍{it['votes']} 💬{it['comments']}"
-    title = f'<a href="{e(it["url"])}">{e(it["title"])}</a>'
-    line2 = f"   🔑 {e(hit)}" + (f" · {e(meta)}" if meta else "") + stats + f" · {it['source']}"
-    return f"{n}. {title}\n{line2}"
+    links = " · ".join(f'<a href="{e(x["url"])}">{x["source"]}</a>' for x, _ in group)
+    head = f'{n}. <a href="{e(it["url"])}">{e(it["title"])}</a>'
+    tag = f"🔑 {e(info['word'])}" if info.get("word") else ""
+    line2 = "   " + " · ".join(x for x in [tag, e(meta)] if x) + stats + f" · {links}"
+    if note:
+        line2 += f"\n   💬 {e(note)}"
+    return f"{head}\n{line2}"
 
 
-def build_digest(picks):
-    head = f"🛒 <b>핫딜 알림</b> — 관심 딜 {len(picks)}건\n"
-    msgs, cur = [], head
-    for n, (it, hit) in enumerate(picks, 1):
-        block = "\n" + fmt(it, hit, n) + "\n"
-        if len(cur) + len(block) > 3900:
-            msgs.append(cur)
-            cur = ""
+def send_alert(state, title, entries, kind, notes=None):
+    """entries: [(item, info)] → 같은 상품끼리 묶어 👍/👎 버튼과 함께 전송. info={'word','unit'}"""
+    if not entries or not state.get("chat_id"):
+        return
+    groups = group_similar(entries)
+    msgs, cur, btns, row = [], f"{title} {len(groups)}건\n", [], []
+    for n, g in enumerate(groups, 1):
+        it = g[0][0]
+        block = "\n" + fmt_group(g, n, (notes or {}).get(it["id"], "")) + "\n"
+        if len(cur) + len(block) > 3800 or len(btns) >= 20:
+            if row:
+                btns.append(row)
+            msgs.append((cur, btns))
+            cur, btns, row = "", [], []
         cur += block
-    msgs.append(cur)
-    return msgs
+        row += [{"text": f"{n} 👍", "callback_data": f"up|{it['id']}"},
+                {"text": f"{n} 👎", "callback_data": f"dn|{it['id']}"}]
+        if len(row) == 4:
+            btns.append(row)
+            row = []
+        for x, info in g:
+            state.setdefault("alerted", {})[x["id"]] = {"title": x["title"], "word": info.get("word"),
+                                                        "kind": kind, "sig": sorted(sig(x["title"])),
+                                                        "t": time.time()}
+    if row:
+        btns.append(row)
+    msgs.append((cur, btns))
+    for text, b in msgs:
+        send(state["chat_id"], text, b)
 
 
 # ───────────────────────── 딜 확인 ─────────────────────────
@@ -410,8 +752,14 @@ def is_blocked(state, name):
     return time.time() < state.get("blocked_until", {}).get(name, 0)
 
 
-def scan_deals(state, kws, names):
-    """names 사이트들의 새 글을 확인. 막힌 사이트는 pending으로 남겨 차단이 풀린 뒤 다음 실행에서 다시 시도"""
+def is_popular(it):
+    rule = POP.get(it["id"][:2] == "fm" and "fmkorea" or "ppomppu", {})
+    return num(it["votes"]) >= rule.get("votes", 10 ** 9) or num(it["comments"]) >= rule.get("comments", 10 ** 9)
+
+
+def collect(state, data, names):
+    """names 사이트의 새 글 수집 → 즉시 알림/인기 알림 보내고 나머지 키워드 딜은 queue에 모음"""
+    kws = data["keywords"]
     seen = set(state.get("seen", []))
     fetched = []
     pending = state.setdefault("pending", {})
@@ -421,8 +769,9 @@ def scan_deals(state, kws, names):
             pending[name] = True
             log(f"{name}: 접속 제한 중이라 나중에 다시 시도")
             continue
+        min_pages = POP.get(name, {}).get("pages", 1) if POP.get("enabled", True) else 1
         try:
-            got, err = paginate(fn, seen, pages, delay)
+            got, err = paginate(fn, seen, pages, delay, min_pages)
         except Exception as e:
             got, err = [], e
         if got:
@@ -446,34 +795,90 @@ def scan_deals(state, kws, names):
             send(state["chat_id"], f"⚠️ {LABEL[name]} 보안 시스템이 자동 접속을 계속 막고 있어요. "
                                    f"막힌 동안의 {LABEL[name]} 딜은 알림이 늦거나 빠질 수 있습니다.")
 
-    new_items = [it for it in fetched if it["id"] not in seen]
-    log(f"새 글 {len(new_items)}건")
+    now = time.time()
     first_run = not state.get("seen")
+    watch = state.setdefault("watch", {})
+    init_watch = not watch
+    new_items = [it for it in fetched if it["id"] not in seen]
     state["seen"] = state.get("seen", []) + [it["id"] for it in new_items]
+    log(f"새 글 {len(new_items)}건")
+
+    # 인기 추적용: 새 글은 처음 본 시각을 기록, 이미 추적 중인 글은 추천·댓글 갱신
+    for it in fetched:
+        if it["id"] in watch:
+            watch[it["id"]].update({k: it[k] for k in ("votes", "comments", "ended")})
+        elif it["id"] not in seen or init_watch:
+            watch[it["id"]] = {**it, "first": now, "done": init_watch and is_popular(it)}
+    max_age = POP.get("max_age_hours", 8) * 3600
+    state["watch"] = watch = {k: v for k, v in watch.items() if now - v["first"] < max_age}
+
     if first_run:
         log("첫 실행: 기존 글은 기록만 함")
         return
 
-    picks, dup = [], set()
+    urgent, queued = [], 0
     for it in new_items:
         if it["ended"]:
             continue
         m = match_keyword(it["title"], kws)
-        if m and norm(it["title"]) not in dup:
-            dup.add(norm(it["title"]))
-            picks.append((it, m[0]["word"]))
-    log(f"알림 대상 {len(picks)}건")
-    if picks and state.get("chat_id"):   # 관심 딜이 없으면 조용히
-        for text in build_digest(picks):
-            send(state["chat_id"], text)
+        if not m:
+            continue
+        kw = m[0]
+        unit, ok, bargain = price_check(it, kw)
+        if not ok:
+            log(f"단가 기준 초과로 제외: {it['title']} ({unit})")
+            continue
+        if recently_alerted(state, it["title"], "kw"):
+            continue
+        info = {"word": kw["word"], "unit": unit}
+        if kw.get("urgent") or bargain:
+            urgent.append((it, info))
+        else:
+            state.setdefault("queue", []).append({"item": it, "info": info})
+            queued += 1
+    log(f"즉시 알림 {len(urgent)}건, 묶음 대기 {queued}건")
+    send_alert(state, "⚡ <b>바로 확인할 딜</b> —", urgent, "kw")
+
+    if POP.get("enabled", True):
+        hot = []
+        for w in watch.values():
+            if w.get("done") or w["ended"] or not is_popular(w):
+                continue
+            w["done"] = True
+            t = norm(w["title"])
+            if any(norm(x) in t for x in CONFIG.get("exclude_keywords", []) + data.get("pop_exclude", [])):
+                continue
+            if blocked_by_keyword(w["title"], kws):      # 예: 항공권 키워드의 지방 출발 제외 규칙
+                continue
+            if recently_alerted(state, w["title"], "pop"):
+                continue
+            unit, _, _ = price_check(w, (match_keyword(w["title"], kws) or [None])[0])
+            hot.append({**w, "_age": max(1, round((now - w["first"]) / 3600)), "_unit": unit})
+        log(f"인기 딜 {len(hot)}건")
+        if hot:
+            reasons = popular_reasons(hot)
+            entries = [(h, {"word": (match_keyword(h["title"], kws) or [{}])[0].get("word"), "unit": h["_unit"]})
+                       for h in hot]
+            send_alert(state, "🔥 <b>지금 인기 딜</b> —", entries, "pop", reasons)
+
+
+def send_digest(state):
+    """3시간 동안 모은 키워드 딜을 묶어서 전송 (그사이 종료된 딜은 뺌)"""
+    queue, state["queue"] = state.get("queue", []), []
+    watch = state.get("watch", {})
+    entries = [(q["item"], q["info"]) for q in queue
+               if not watch.get(q["item"]["id"], {}).get("ended")
+               and not recently_alerted(state, q["item"]["title"], "kw")]   # ⚡로 이미 보낸 같은 상품은 뺌
+    log(f"묶음 알림 {len(entries)}건")
+    send_alert(state, "🛒 <b>핫딜 알림</b> — 관심 딜", entries, "kw")
 
 
 # ───────────────────────── 메인 ─────────────────────────
 def main():
     if not BOT_TOKEN and not DRY_RUN:
-        sys.exit("TELEGRAM_BOT_TOKEN 이 없습니다 (GitHub Secret 확인)")
+        sys.exit("TELEGRAM_BOT_TOKEN 이 없습니다 (.env 확인)")
     state = load_state()
-    kws = load_keywords()
+    data = load_keywords()
     if CONFIG.get("chat_id"):
         state["chat_id"] = str(CONFIG["chat_id"])
 
@@ -481,27 +886,33 @@ def main():
     changed = False
     if not DRY_RUN:
         try:
-            changed = handle_commands(state, kws)
+            changed = handle_commands(state, data)
         except Exception as e:
             log("⚠️ 명령 처리 실패:", e)
     if changed:
-        save_keywords(kws)
+        save_keywords(data)
         log("keywords.json 변경됨")
     if is_new and state.get("chat_id"):
-        send(state["chat_id"], "✅ <b>핫딜 알리미 연결 완료</b>\n등록된 키워드에 맞는 딜만 3시간마다 묶어서 보내드릴게요.")
+        send(state["chat_id"], "✅ <b>핫딜 알리미 연결 완료</b>\n등록된 키워드에 맞는 딜은 3시간마다 묶어서, 급한 딜과 인기 딜은 바로 보내드릴게요.")
 
+    now = datetime.now(KST)
     enabled = [n for n in SOURCES if CONFIG.get("sources", {}).get(n, True)]
-    slot = scan_slot(datetime.now(KST))
+    night = now.hour // 3 == 1
+    due = time.time() - state.get("last_collect", 0) >= CONFIG.get("collect_minutes", 30) * 60
     retry = [n for n in enabled if state.get("pending", {}).get(n) and not is_blocked(state, n)]
-    if FORCE_SCAN or (slot and slot != state.get("last_slot")):
-        scan_deals(state, kws, enabled)
-        if slot:
-            state["last_slot"] = slot
-    elif retry:
+    if FORCE_SCAN or (due and not night):
+        collect(state, data, enabled)
+        state["last_collect"] = time.time()
+    elif retry and not night:
         log(f"차단이 풀린 사이트 다시 확인: {', '.join(retry)}")
-        scan_deals(state, kws, retry)
+        collect(state, data, retry)
     else:
-        log("이번 실행은 명령만 처리 (딜 확인은 3시간 단위)")
+        log("이번 실행은 명령만 처리")
+
+    slot = scan_slot(now)
+    if slot and slot != state.get("last_slot"):
+        send_digest(state)
+        state["last_slot"] = slot
     save_state(state)
 
 
