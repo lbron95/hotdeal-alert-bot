@@ -3,7 +3,7 @@
 
 5분마다 실행되며
   · 매번: 텔레그램 명령·버튼(👍/👎) 처리
-  · 30분마다(새벽 3~6시 제외): 새 글 수집
+  · 30분마다(방해 금지 23:00~07:30 제외): 새 글 수집
       - ⚡ 급한 키워드 / 기준 단가보다 훨씬 싼 딜 → 즉시 알림
       - 🔥 키워드와 상관없이 추천·댓글이 빠르게 붙은 인기 딜 → 이유 한 줄과 함께 즉시 알림
       - 나머지 키워드 딜 → 모아뒀다가 3시간마다 메시지 1개로 묶어 전송
@@ -445,7 +445,8 @@ def parse_command(text, kws):
                 "너는 핫딜 알림 봇의 명령 해석기야. 사용자의 메시지를 읽고 JSON으로만 답해.\n"
                 f"현재 등록된 키워드: {current}\n\n"
                 "action 종류: add(알림 추가), remove(알림 끄기), list(목록 보기), help(사용법), "
-                "price(단가 기준 설정/해제), urgent(즉시 알림 켜기/끄기), none(명령 아님)\n"
+                "price(단가 기준 설정/해제), urgent(즉시 알림 켜기/끄기), "
+                "status(사이트 접속·봇 작동 상태 질문, 예: '펨코 막혔어?', '잘 돌아가?'), none(명령 아님)\n"
                 "remove/price/urgent일 때 word(s)에는 현재 등록된 키워드 중 해당하는 것을 정확히 적는다.\n"
                 "price: '계란 1구 300원 이하만' → unit은 구/개/캔/팩/병/100ml/100g/kg/L 중 하나, max는 원 단위 정수. "
                 "'기준 없애줘'면 max는 null.\n"
@@ -468,6 +469,8 @@ def parse_command(text, kws):
         return {"action": "list"}
     if re.search(r"사용법|도움|help", t, re.I) or t.startswith("/start"):
         return {"action": "help"}
+    if re.search(r"상태|막혔|막힌|차단|작동|돌아가", t):
+        return {"action": "status"}
     m = re.match(r"(.+?)\s*제외어\s*(.+?)\s*(?:을|를)?\s*(빼|삭제|취소|없애)", t)
     if m:
         return {"action": "unexclude", "word": m.group(1).strip(), "exclude": m.group(2).strip()}
@@ -551,8 +554,29 @@ HELP = ("🛒 <b>핫딜 알리미 사용법</b>\n"
         "• <code>러닝화는 바로 알려줘</code> → ⚡ 즉시 알림 (<code>묶어서 보내줘</code>로 해제)\n"
         "• <code>계란 1구 300원 이하만</code> → 💰 단가 기준 (<code>계란 기준 없애줘</code>로 해제)\n"
         "• <code>키워드 목록</code> → 현재 목록 보기\n"
+        "• <code>상태</code> → 사이트 접속·봇 작동 상태\n"
         "• 알림의 👎 → 비슷한 딜이 다시 안 오게 제외어 자동 추가\n"
         "키워드 딜은 3시간마다 묶어서, ⚡·🔥 인기 딜은 바로 보내드려요.")
+
+
+def status_text(state):
+    """사이트별 수집 상태 요약"""
+    now = time.time()
+    lines = ["🩺 <b>핫딜 알리미 상태</b>"]
+    for name in SOURCES:
+        if not CONFIG.get("sources", {}).get(name, True):
+            lines.append(f"• {LABEL[name]}: 꺼짐")
+            continue
+        since = state.get("fail_since", {}).get(name)
+        if since:
+            left = max(0, state.get("blocked_until", {}).get(name, 0) - now)
+            lines.append(f"• {LABEL[name]}: ⛔ {(now - since) / 3600:.0f}시간째 접속 차단 "
+                         f"(보안 시스템) — {left / 60:.0f}분 뒤 다시 시도")
+        else:
+            ago = (now - state.get("last_collect_src", {}).get(name, now)) / 60
+            lines.append(f"• {LABEL[name]}: ✅ 정상 (마지막 확인 {ago:.0f}분 전)")
+    lines.append(f"• 묶음 대기 중인 딜: {len(state.get('queue', []))}건")
+    return "\n".join(lines)
 
 
 def find_kw(kws, word):
@@ -651,6 +675,8 @@ def handle_commands(state, data):
             reply = (f"📋 <b>알림 키워드 {len(kws)}개</b>\n" + "\n".join(fmt_kw(k) for k in kws)) if kws else "등록된 키워드가 없어요."
             if data.get("pop_exclude"):
                 reply += "\n\n🔥 인기 딜 제외: " + html.escape(", ".join(data["pop_exclude"]))
+        elif act == "status":
+            reply = status_text(state)
         elif act == "help":
             reply = HELP
         else:
@@ -818,14 +844,44 @@ def mark_ended(state, ended_ids):
 
 
 # ───────────────────────── 딜 확인 ─────────────────────────
+def _minutes(hhmm, default):
+    try:
+        h, m = str(hhmm).split(":")
+        return int(h) * 60 + int(m)
+    except ValueError:
+        return default
+
+
+def quiet_range():
+    """방해 금지 (시작, 끝) — 자정부터 센 분. 기본 23:00~07:30"""
+    q = CONFIG.get("quiet_hours", {})
+    return _minutes(q.get("start", "23:00"), 23 * 60), _minutes(q.get("end", "07:30"), 450)
+
+
+def is_quiet(now):
+    """방해 금지 시간인지. 이 시간에는 수집도 알림도 하지 않음 (명령 답장만)"""
+    start, end = quiet_range()
+    t = now.hour * 60 + now.minute
+    return (start <= t or t < end) if start > end else (start <= t < end)
+
+
 def scan_slot(now):
-    """3시간 단위 슬롯 번호. 새벽 3~6시(슬롯 1)는 건너뜀"""
-    slot = now.hour // 3
-    return None if slot == 1 else now.strftime("%Y%m%d-") + str(slot)
+    """묶음 알림 슬롯. 방해 금지가 끝난 뒤 첫 실행(아침), 이후 3시간 단위(9·12·15·18·21시),
+    방해 금지 시작 10분 전에 마지막으로 한 번 더. 방해 금지 시간에는 None"""
+    if is_quiet(now):
+        return None
+    day = now.strftime("%Y%m%d-")
+    start, end = quiet_range()
+    t = now.hour * 60 + now.minute
+    if 0 < start - t <= 10:
+        return day + "last"
+    if end <= t < (end // 180 + 1) * 180:           # 07:30 ~ 09:00
+        return day + "morning"
+    return day + str(now.hour // 3)
 
 
 # 사이트별 (수집 함수, 최대 페이지, 페이지 사이 대기초). 펨코는 보안 시스템이 잦은 요청을 막으므로 천천히
-SOURCES = {"fmkorea": (fetch_fmkorea_page, 3, 10), "ppomppu": (fetch_ppomppu_page, 8, 2)}
+SOURCES = {"fmkorea": (fetch_fmkorea_page, 3, 15), "ppomppu": (fetch_ppomppu_page, 8, 2)}
 LABEL = {"fmkorea": "에펨코리아", "ppomppu": "뽐뿌"}
 
 
@@ -858,23 +914,28 @@ def collect(state, data, names):
         if got:
             log(f"{name}: {len(got)}건 수집")
             fetched += got
+        state.setdefault("last_collect_src", {})[name] = time.time()
         if err is None:
             pending.pop(name, None)
             state.setdefault("fail", {})[name] = 0
+            state.setdefault("fail_since", {}).pop(name, None)
             continue
-        # 실패: 차단 시간을 기록하고 풀리면 다시 시도 (Retry-After 준수, 재시도로 몰아붙이지 않음)
-        wait = retry_after(err)
-        state.setdefault("blocked_until", {})[name] = time.time() + wait
-        pending[name] = True
+        # 실패: 점점 길게 쉬었다가 다시 시도 (1→2→4→8→12시간). 짧게 자주 두드리면 차단이 계속 연장됨
         n = state.setdefault("fail", {}).get(name, 0) + 1
         state["fail"][name] = n
+        backoff = [3600, 7200, 14400, 28800, 43200][min(n, 5) - 1]
+        wait = max(retry_after(err), backoff)
+        state.setdefault("blocked_until", {})[name] = time.time() + wait
+        state.setdefault("fail_since", {}).setdefault(name, time.time())
+        pending[name] = True
         log(f"⚠️ {name} 수집 실패 ({n}회 연속, {wait // 60}분 뒤 재시도): {err}")
         today = datetime.now(KST).strftime("%Y-%m-%d")
         warned = state.setdefault("warned", {})
-        if n >= 6 and warned.get(name) != today and state.get("chat_id"):   # 하루 1번만 알림
+        hours = (time.time() - state["fail_since"][name]) / 3600
+        if hours >= 6 and warned.get(name) != today and state.get("chat_id"):   # 6시간 넘게 막히면 하루 1번 알림
             warned[name] = today
-            send(state["chat_id"], f"⚠️ {LABEL[name]} 보안 시스템이 자동 접속을 계속 막고 있어요. "
-                                   f"막힌 동안의 {LABEL[name]} 딜은 알림이 늦거나 빠질 수 있습니다.")
+            send(state["chat_id"], f"⚠️ {LABEL[name]} 보안 시스템이 자동 접속을 {hours:.0f}시간째 막고 있어요. "
+                                   f"접속 간격을 늘려 기다리는 중이라 {LABEL[name]} 딜은 늦거나 빠질 수 있습니다.")
 
     now = time.time()
     first_run = not state.get("seen")
@@ -994,15 +1055,18 @@ def main():
 
     now = datetime.now(KST)
     enabled = [n for n in SOURCES if CONFIG.get("sources", {}).get(n, True)]
-    night = now.hour // 3 == 1
-    due = time.time() - state.get("last_collect", 0) >= CONFIG.get("collect_minutes", 30) * 60
+    night = is_quiet(now)                  # 방해 금지 시간: 수집·알림 없음 (명령 답장만)
+    every = CONFIG.get("collect_minutes", {})
+    last = state.get("last_collect_src", {})
+    due = [n for n in enabled
+           if time.time() - last.get(n, 0) >= (every.get(n, 30) if isinstance(every, dict) else every) * 60]
     retry = [n for n in enabled if state.get("pending", {}).get(n) and not is_blocked(state, n)]
-    if FORCE_SCAN or (due and not night):
-        collect(state, data, enabled)
-        state["last_collect"] = time.time()
-    elif retry and not night:
-        log(f"차단이 풀린 사이트 다시 확인: {', '.join(retry)}")
-        collect(state, data, retry)
+    names = [n for n in enabled if FORCE_SCAN or (not night and (n in due or n in retry))]
+    names = [n for n in names if FORCE_SCAN or not is_blocked(state, n)]   # 막힌 사이트는 기다림
+    if names:
+        if retry:
+            log(f"다시 확인할 사이트: {', '.join(retry)}")
+        collect(state, data, names)
     else:
         log("이번 실행은 명령만 처리")
 
@@ -1022,7 +1086,8 @@ def report_error(err):
         state["errors"] = n = state.get("errors", 0) + 1
         state["last_run"] = time.time()
         today = datetime.now(KST).strftime("%Y-%m-%d")
-        if n >= 6 and state.get("err_warned") != today and state.get("chat_id") and BOT_TOKEN:
+        if (n >= 6 and state.get("err_warned") != today and state.get("chat_id") and BOT_TOKEN
+                and not is_quiet(datetime.now(KST))):
             state["err_warned"] = today
             send(state["chat_id"], f"⚠️ <b>핫딜 알리미 오류</b>\n{n}번 연속 실행에 실패했어요. "
                                    f"PC의 logs 폴더를 확인해 주세요.\n<code>{html.escape(str(err))[:300]}</code>")
