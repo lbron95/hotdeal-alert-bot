@@ -158,8 +158,10 @@ def fetch_ppomppu_page(page):
         a = tr.select_one("a.baseList-title")
         if not a:
             continue
-        m = re.search(r"no=(\d+)", a.get("href", ""))
-        if not m:
+        href = a.get("href", "")
+        m = re.search(r"no=(\d+)", href)
+        # 목록 위쪽에 섞여 나오는 다른 게시판 글(뽐뿌마켓 홍보 id=pmarket, 소셜 잡담 id=social 등)은 핫딜이 아니므로 제외
+        if not m or not re.search(r"[?&]id=ppomppu(&|$)", href):
             continue
         head = tr.select_one(".baseList-head")
         cat = tr.select_one(".baseList-small")
@@ -791,9 +793,48 @@ def render(msg):
     return out
 
 
+def page_title(url):
+    """글 페이지의 실제 제목 (못 읽으면 None)"""
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    text = r.content.decode("euc-kr" if "ppomppu" in url else "utf-8", errors="replace")
+    soup = BeautifulSoup(text, "html.parser")
+    og = soup.find("meta", attrs={"property": "og:title"})
+    t = (og.get("content") if og else "") or (soup.title.get_text() if soup.title else "")
+    return re.sub(r"\s+", " ", t).strip() or None
+
+
+def link_ok(state, it):
+    """보내기 전 검증: 링크를 열어 실제 글 제목이 알림 제목과 같은 글인지 확인.
+    다른 글이면 False. 사이트 접속이 안 되면 놓치지 않도록 True (펨코는 차단 위험 때문에 직접 열지 않음)"""
+    cache = state.setdefault("verified", {})
+    if it["id"] in cache:
+        return cache[it["id"]]
+    if it["id"].startswith("fm:"):
+        ok = bool(re.fullmatch(r"https://www\.fmkorea\.com/\d+", it["url"]))
+    else:
+        try:
+            real = page_title(it["url"])
+            a, b = sig(it["title"]), sig(real or "")
+            ok = bool(real) and len(a & b) / max(1, min(len(a), len(b))) >= 0.5
+            if not ok:
+                log(f"⚠️ 링크 불일치로 제외: '{it['title']}' → 실제 글 '{real}'")
+            time.sleep(1)
+        except Exception as e:
+            log("⚠️ 링크 검증 실패(그대로 보냄):", e)
+            return True
+    cache[it["id"]] = ok
+    if len(cache) > 1000:
+        state["verified"] = dict(list(cache.items())[-500:])
+    return ok
+
+
 def send_alert(state, title, entries, kind, notes=None):
     """entries: [(item, info)] → 같은 상품끼리 묶어 👍/👎 버튼과 함께 전송. info={'word','unit','hist'}"""
     if not entries or not state.get("chat_id"):
+        return
+    entries = [e for e in entries if link_ok(state, e[0])]      # 링크가 엉뚱한 글이면 보내지 않음
+    if not entries:
         return
     groups = group_similar(entries)
     msgs, cur, btns, row = [], {"head": f"{title} {len(groups)}건\n", "blocks": []}, [], []
