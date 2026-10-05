@@ -41,8 +41,17 @@ SEEN_LIMIT = 4000
 POP = CONFIG.get("popular", {})
 
 
+def mask(s):
+    """토큰·API 키가 로그나 메시지에 찍히지 않도록 가림"""
+    s = str(s)
+    for secret in (BOT_TOKEN, GEMINI_KEY):
+        if secret:
+            s = s.replace(secret, "***")
+    return s
+
+
 def log(*a):
-    print(*a, flush=True)
+    print(mask(" ".join(map(str, a))), flush=True)
 
 
 # ───────────────────────── 저장 ─────────────────────────
@@ -749,8 +758,12 @@ def tg(method, **params):
     if DRY_RUN and method != "getUpdates":
         log(f"[DRY] {method}: {params.get('text', '')}")
         return {}
-    r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params, timeout=30)
-    data = r.json()
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params, timeout=30)
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        # 연결 오류 메시지에는 토큰이 든 URL이 포함되므로 원래 예외를 숨기고 종류만 남김
+        raise RuntimeError(f"Telegram {method} 연결 실패 ({type(e).__name__})") from None
     if not data.get("ok"):
         raise RuntimeError(f"Telegram {method} 실패: {data.get('description')}")
     return data["result"]
@@ -798,6 +811,8 @@ def page_title(url):
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     text = r.content.decode("euc-kr" if "ppomppu" in url else "utf-8", errors="replace")
+    if "게시물이 존재하지 않습니다" in text:
+        return "(삭제된 글)"
     soup = BeautifulSoup(text, "html.parser")
     og = soup.find("meta", attrs={"property": "og:title"})
     t = (og.get("content") if og else "") or (soup.title.get_text() if soup.title else "")
@@ -816,8 +831,10 @@ def link_ok(state, it):
         try:
             real = page_title(it["url"])
             a, b = sig(it["title"]), sig(real or "")
-            ok = bool(real) and len(a & b) / max(1, min(len(a), len(b))) >= 0.5
-            if not ok:
+            ok = bool(real) and real != "(삭제된 글)" and len(a & b) / max(1, min(len(a), len(b))) >= 0.5
+            if real == "(삭제된 글)":
+                log(f"보내기 전 삭제된 글이라 제외: '{it['title']}'")
+            elif not ok:
                 log(f"⚠️ 링크 불일치로 제외: '{it['title']}' → 실제 글 '{real}'")
             time.sleep(1)
         except Exception as e:
@@ -1131,7 +1148,7 @@ def report_error(err):
                 and not is_quiet(datetime.now(KST))):
             state["err_warned"] = today
             send(state["chat_id"], f"⚠️ <b>핫딜 알리미 오류</b>\n{n}번 연속 실행에 실패했어요. "
-                                   f"PC의 logs 폴더를 확인해 주세요.\n<code>{html.escape(str(err))[:300]}</code>")
+                                   f"PC의 logs 폴더를 확인해 주세요.\n<code>{html.escape(mask(err))[:300]}</code>")
         save_state(state)
     except Exception as e:
         log("⚠️ 오류 기록 실패:", e)
@@ -1144,6 +1161,6 @@ if __name__ == "__main__":
         raise
     except Exception as err:
         import traceback
-        traceback.print_exc()
+        log(traceback.format_exc())          # mask()로 토큰을 가린 뒤 기록
         report_error(err)
         sys.exit(1)
