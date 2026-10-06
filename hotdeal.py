@@ -3,10 +3,9 @@
 
 5분마다 실행되며
   · 매번: 텔레그램 명령·버튼(👍/👎) 처리
-  · 30분마다(방해 금지 23:00~07:30 제외): 새 글 수집
-      - ⚡ 급한 키워드 / 기준 단가보다 훨씬 싼 딜 → 즉시 알림
-      - 🔥 키워드와 상관없이 추천·댓글이 빠르게 붙은 인기 딜 → 이유 한 줄과 함께 즉시 알림
-      - 나머지 키워드 딜 → 모아뒀다가 3시간마다 메시지 1개로 묶어 전송
+  · 30분마다(펨코는 2시간마다) 새 글 수집 — 밤에도 조용히 수집만 함
+      - ⚡ 급한 키워드 / 기준 단가보다 훨씬 싼 딜, 🔥 추천·댓글이 빠르게 붙은 인기 딜(이유 한 줄), 🛒 키워드 딜
+      → 모두 모아뒀다가 하루 4번(기본 07:20·12:00·18:00·22:30) 메시지 1개로 묶어 전송
 키워드는 keywords.json 에 저장됩니다.
 """
 import html
@@ -562,12 +561,12 @@ def fmt_kw(k):
 HELP = ("🛒 <b>핫딜 알리미 사용법</b>\n"
         "• <code>단백질 알림 해줘</code> → 키워드 추가 (프로틴 등 연관어 자동 포함)\n"
         "• <code>단백질 알림 꺼줘</code> → 키워드 삭제\n"
-        "• <code>러닝화는 바로 알려줘</code> → ⚡ 즉시 알림 (<code>묶어서 보내줘</code>로 해제)\n"
+        "• <code>러닝화는 바로 알려줘</code> → ⚡ 알림 맨 위에 표시 (<code>묶어서 보내줘</code>로 해제)\n"
         "• <code>계란 1구 300원 이하만</code> → 💰 단가 기준 (<code>계란 기준 없애줘</code>로 해제)\n"
         "• <code>키워드 목록</code> → 현재 목록 보기\n"
         "• <code>상태</code> → 사이트 접속·봇 작동 상태\n"
         "• 알림의 👎 → 비슷한 딜이 다시 안 오게 제외어 자동 추가\n"
-        "키워드 딜은 3시간마다 묶어서, ⚡·🔥 인기 딜은 바로 보내드려요.")
+        "알림은 하루 4번(07:20·12:00·18:00·22:30) ⚡·🔥·🛒 딜을 모아서 보내드려요.")
 
 
 def status_text(state):
@@ -669,8 +668,8 @@ def handle_commands(state, data):
             else:
                 kw["urgent"] = bool(cmd.get("on", True))
                 changed = True
-                reply = (f"⚡ {html.escape(kw['word'])} 딜은 올라오면 바로 알려드릴게요." if kw["urgent"]
-                         else f"📦 {html.escape(kw['word'])} 딜은 3시간마다 묶어서 보내드릴게요.")
+                reply = (f"⚡ {html.escape(kw['word'])} 딜은 알림 맨 위 '바로 확인할 딜'에 넣어 드릴게요." if kw["urgent"]
+                         else f"📦 {html.escape(kw['word'])} 딜은 '관심 딜'에 넣어 드릴게요.")
         elif act == "unexclude":
             w = str(cmd.get("exclude") or "").strip()
             kw = find_kw(kws, cmd.get("word") or "")
@@ -769,10 +768,12 @@ def tg(method, **params):
     return data["result"]
 
 
-def send(chat_id, text, buttons=None):
+def send(chat_id, text, buttons=None, silent=False):
     """전송 후 Telegram 메시지 객체를 돌려줌 (실패하면 None)"""
     try:
         extra = {"reply_markup": {"inline_keyboard": buttons}} if buttons else {}
+        if silent:
+            extra["disable_notification"] = True
         return tg("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
                   link_preview_options={"is_disabled": True}, **extra)
     except Exception as e:
@@ -801,6 +802,8 @@ def render(msg):
     """저장해 둔 알림 메시지를 다시 그림 (종료된 딜은 취소선 + ⛔)"""
     out = msg["head"]
     for b in msg["blocks"]:
+        if b.get("sec"):                      # 구역 제목 (⚡ / 🔥 / 🛒)
+            out += f"\n{b['sec']}\n"
         out += (f"\n<s>{b['line1']}</s> ⛔종료\n{b['rest']}\n" if b.get("ended")
                 else f"\n{b['line1']}\n{b['rest']}\n")
     return out
@@ -847,38 +850,53 @@ def link_ok(state, it):
 
 
 def send_alert(state, title, entries, kind, notes=None):
-    """entries: [(item, info)] → 같은 상품끼리 묶어 👍/👎 버튼과 함께 전송. info={'word','unit','hist'}"""
-    if not entries or not state.get("chat_id"):
+    """구역 하나짜리 알림 (기존 호출용)"""
+    send_bundle(state, title, [("", entries, kind, notes)])
+
+
+def send_bundle(state, title, sections):
+    """여러 구역을 메시지 하나로 묶어 👍/👎 버튼과 함께 전송.
+    sections: [(구역 제목, [(item, info)], kind, notes)] — info={'word','unit','hist'}, notes={id: 한 줄 설명}"""
+    if not state.get("chat_id"):
         return
-    entries = [e for e in entries if link_ok(state, e[0])]      # 링크가 엉뚱한 글이면 보내지 않음
-    if not entries:
+    prepared = []
+    for sec, entries, kind, notes in sections:
+        entries = [e for e in entries if link_ok(state, e[0])]      # 링크가 엉뚱한 글이면 보내지 않음
+        if entries:
+            prepared.append((sec, group_similar(entries), kind, notes or {}))
+    total = sum(len(gs) for _, gs, _, _ in prepared)
+    if not total:
         return
-    groups = group_similar(entries)
-    msgs, cur, btns, row = [], {"head": f"{title} {len(groups)}건\n", "blocks": []}, [], []
-    for n, g in enumerate(groups, 1):
-        it = g[0][0]
-        line1, rest = fmt_group(g, n, (notes or {}).get(it["id"], ""))
-        block = {"ids": [x["id"] for x, _ in g], "line1": line1, "rest": rest}
-        if len(render(cur)) + len(line1) + len(rest) > 3700 or len(btns) >= 20:
-            if row:
+    msgs, cur, btns, row = [], {"head": f"{title} {total}건\n", "blocks": []}, [], []
+    n = 0
+    for sec, groups, kind, notes in prepared:
+        for i, g in enumerate(groups):
+            n += 1
+            it = g[0][0]
+            line1, rest = fmt_group(g, n, notes.get(it["id"], ""))
+            block = {"ids": [x["id"] for x, _ in g], "line1": line1, "rest": rest}
+            if i == 0 and sec:
+                block["sec"] = sec
+            if len(render(cur)) + len(line1) + len(rest) + len(sec) > 3700 or len(btns) >= 20:
+                if row:
+                    btns.append(row)
+                msgs.append((cur, btns))
+                cur, btns, row = {"head": "", "blocks": []}, [], []
+            cur["blocks"].append(block)
+            row += [{"text": f"{n} 👍", "callback_data": f"up|{it['id']}"},
+                    {"text": f"{n} 👎", "callback_data": f"dn|{it['id']}"}]
+            if len(row) == 4:
                 btns.append(row)
-            msgs.append((cur, btns))
-            cur, btns, row = {"head": "", "blocks": []}, [], []
-        cur["blocks"].append(block)
-        row += [{"text": f"{n} 👍", "callback_data": f"up|{it['id']}"},
-                {"text": f"{n} 👎", "callback_data": f"dn|{it['id']}"}]
-        if len(row) == 4:
-            btns.append(row)
-            row = []
-        for x, info in g:
-            state.setdefault("alerted", {})[x["id"]] = {"title": x["title"], "word": info.get("word"),
-                                                        "kind": kind, "sig": sorted(sig(x["title"])),
-                                                        "t": time.time()}
+                row = []
+            for x, info in g:
+                state.setdefault("alerted", {})[x["id"]] = {"title": x["title"], "word": info.get("word"),
+                                                            "kind": kind, "sig": sorted(sig(x["title"])),
+                                                            "t": time.time()}
     if row:
         btns.append(row)
     msgs.append((cur, btns))
-    for m, b in msgs:
-        res = send(state["chat_id"], render(m), b)
+    for i, (m, b) in enumerate(msgs):
+        res = send(state["chat_id"], render(m), b, silent=i > 0)     # 길어서 나뉘면 두 번째부터는 무음
         if res and res.get("message_id"):     # 종료 표시를 위해 24시간 보관
             state.setdefault("msgs", []).append({**m, "mid": res["message_id"], "buttons": b, "t": time.time()})
     state["msgs"] = [m for m in state.get("msgs", []) if time.time() - m["t"] < 24 * 3600]
@@ -911,31 +929,35 @@ def _minutes(hhmm, default):
 
 
 def quiet_range():
-    """방해 금지 (시작, 끝) — 자정부터 센 분. 기본 23:00~07:30"""
+    """방해 금지 (시작, 끝) — 자정부터 센 분. 기본 23:00~07:20"""
     q = CONFIG.get("quiet_hours", {})
-    return _minutes(q.get("start", "23:00"), 23 * 60), _minutes(q.get("end", "07:30"), 450)
+    return _minutes(q.get("start", "23:00"), 23 * 60), _minutes(q.get("end", "07:20"), 440)
 
 
 def is_quiet(now):
-    """방해 금지 시간인지. 이 시간에는 수집도 알림도 하지 않음 (명령 답장만)"""
+    """방해 금지 시간인지. 이 시간에는 알림을 보내지 않음 (수집과 명령 답장은 함)"""
     start, end = quiet_range()
     t = now.hour * 60 + now.minute
     return (start <= t or t < end) if start > end else (start <= t < end)
 
 
+def send_times():
+    return sorted(_minutes(x, 0) for x in CONFIG.get("send_times", ["07:20", "12:00", "18:00", "22:30"]))
+
+
 def scan_slot(now):
-    """묶음 알림 슬롯. 방해 금지가 끝난 뒤 첫 실행(아침), 이후 3시간 단위(9·12·15·18·21시),
-    방해 금지 시작 10분 전에 마지막으로 한 번 더. 방해 금지 시간에는 None"""
+    """지금 보내야 할 알림 시간의 ID (가장 최근에 지난 알림 시각). 방해 금지 시간에는 None.
+    PC가 꺼져 있어 놓친 시각도 다음 실행에서 이 ID로 한 번 보냄"""
     if is_quiet(now):
         return None
-    day = now.strftime("%Y%m%d-")
-    start, end = quiet_range()
     t = now.hour * 60 + now.minute
-    if 0 < start - t <= 10:
-        return day + "last"
-    if end <= t < (end // 180 + 1) * 180:           # 07:30 ~ 09:00
-        return day + "morning"
-    return day + str(now.hour // 3)
+    times = send_times()
+    past = [x for x in times if x <= t]
+    if past:
+        day, m = now, past[-1]
+    else:                                           # 첫 알림 시각 전이면 전날 마지막 시각
+        day, m = now - timedelta(days=1), times[-1]
+    return day.strftime("%Y%m%d-") + f"{m // 60:02d}{m % 60:02d}"
 
 
 # 사이트별 (수집 함수, 최대 페이지, 페이지 사이 대기초). 펨코는 보안 시스템이 잦은 요청을 막으므로 천천히
@@ -953,7 +975,7 @@ def is_popular(it):
 
 
 def collect(state, data, names):
-    """names 사이트의 새 글 수집 → 즉시 알림/인기 알림 보내고 나머지 키워드 딜은 queue에 모음"""
+    """names 사이트의 새 글 수집 → ⚡·🔥·🛒 딜을 queue에 모음 (전송은 send_digest가 정해진 시각에)"""
     kws = data["keywords"]
     seen = set(state.get("seen", []))
     fetched = []
@@ -1033,17 +1055,15 @@ def collect(state, data, names):
             continue
         hist, cheap = history_note(state, kw, it)
         info = {"word": kw["word"], "unit": unit, "hist": hist}
-        if kw.get("urgent") or bargain or cheap:
-            urgent.append((it, info))
-        else:
-            state.setdefault("queue", []).append({"item": it, "info": info})
-            queued += 1
+        sec = "urgent" if (kw.get("urgent") or bargain or cheap) else "kw"
+        state.setdefault("queue", []).append({"item": it, "info": info, "sec": sec})
+        urgent += [it] if sec == "urgent" else []
+        queued += 1
     for it in fetched:                     # 가격 이력: 본 딜의 단가를 모두 기록 (종료 딜도 시세 참고용)
         m = match_keyword(it["title"], kws)
         if m:
             record_price(state, m[0], it)
-    log(f"즉시 알림 {len(urgent)}건, 묶음 대기 {queued}건")
-    send_alert(state, "⚡ <b>바로 확인할 딜</b> —", urgent, "kw")
+    log(f"알림 대기 추가 {queued}건 (그중 ⚡ {len(urgent)}건)")
 
     if POP.get("enabled", True):
         hot = []
@@ -1061,27 +1081,54 @@ def collect(state, data, names):
             kw = (match_keyword(w["title"], kws) or [None])[0]
             unit, _, _ = price_check(w, kw)
             hist = history_note(state, kw, w)[0] if kw else ""
-            hot.append({**w, "_age": max(1, round((now - w["first"]) / 3600)), "_unit": unit,
-                        "_word": kw["word"] if kw else None, "_hist": hist})
-        log(f"인기 딜 {len(hot)}건")
-        resumed = state.pop("resumed_hours", None)
-        if hot:
-            reasons = popular_reasons(hot)
-            entries = [(h, {"word": h["_word"], "unit": h["_unit"], "hist": h["_hist"]}) for h in hot]
-            title = (f"💤 <b>{resumed}시간 쉬는 동안 인기였던 딜</b> —" if resumed
-                     else "🔥 <b>지금 인기 딜</b> —")
-            send_alert(state, title, entries, "pop", reasons)
+            item = {k: v for k, v in w.items() if k not in ("done",)}
+            state.setdefault("queue", []).append(
+                {"item": item, "info": {"word": kw["word"] if kw else None, "unit": unit, "hist": hist}, "sec": "pop"})
+            hot.append(w)
+        log(f"인기 딜 대기 추가 {len(hot)}건")
 
 
-def send_digest(state):
-    """3시간 동안 모은 키워드 딜을 묶어서 전송 (그사이 종료된 딜은 뺌)"""
+SECTIONS = [("urgent", "⚡ <b>바로 확인할 딜</b>", "kw"),
+            ("pop", "🔥 <b>인기 딜</b>", "pop"),
+            ("kw", "🛒 <b>관심 딜</b>", "kw")]
+
+
+def send_digest(state, now):
+    """모아 둔 딜(⚡·🔥·🛒)을 정해진 알림 시각에 메시지 하나로 전송.
+    보내기 직전에 최신 추천·댓글로 갱신하고, 그사이 종료된 딜과 이미 보낸 같은 상품은 뺌"""
     queue, state["queue"] = state.get("queue", []), []
     watch = state.get("watch", {})
-    entries = [(q["item"], q["info"]) for q in queue
-               if not watch.get(q["item"]["id"], {}).get("ended")
-               and not recently_alerted(state, q["item"]["title"], "kw")]   # ⚡로 이미 보낸 같은 상품은 뺌
-    log(f"묶음 알림 {len(entries)}건")
-    send_alert(state, "🛒 <b>핫딜 알림</b> — 관심 딜", entries, "kw")
+    t = time.time()
+    by_sec = {s: [] for s, _, _ in SECTIONS}
+    for q in queue:
+        it, sec = dict(q["item"]), q.get("sec", "kw")
+        w = watch.get(it["id"], {})
+        if w.get("ended"):
+            continue
+        it.update({k: w[k] for k in ("votes", "comments") if k in w})
+        kind = "pop" if sec == "pop" else "kw"
+        if recently_alerted(state, it["title"], kind):
+            continue
+        if sec == "pop":
+            it["_age"] = max(1, round((t - it.get("first", t)) / 3600))
+            it["_unit"] = q["info"].get("unit", "")
+        by_sec[sec].append((it, q["info"]))
+    # 같은 딜(또는 같은 상품)이 여러 구역에 있으면 ⚡ > 🔥 > 🛒 순서로 한 곳에만
+    taken = []
+    for s, _, _ in SECTIONS:
+        keep = []
+        for it, info in by_sec[s]:
+            sg = sig(it["title"])
+            if any(it["id"] == i or similar(sg, g) for i, g in taken):
+                continue
+            taken.append((it["id"], sg))
+            keep.append((it, info))
+        by_sec[s] = keep
+    pops = [it for it, _ in by_sec["pop"]]
+    reasons = popular_reasons(pops) if pops else {}
+    log("알림 전송: " + ", ".join(f"{s} {len(v)}건" for s, v in by_sec.items()))
+    send_bundle(state, f"🛒 <b>핫딜 알림</b> {now:%H:%M} —",
+                [(head, by_sec[s], kind, reasons if s == "pop" else None) for s, head, kind in SECTIONS])
 
 
 # ───────────────────────── 메인 ─────────────────────────
@@ -1104,22 +1151,25 @@ def main():
         save_keywords(data)
         log("keywords.json 변경됨")
     if is_new and state.get("chat_id"):
-        send(state["chat_id"], "✅ <b>핫딜 알리미 연결 완료</b>\n등록된 키워드에 맞는 딜은 3시간마다 묶어서, 급한 딜과 인기 딜은 바로 보내드릴게요.")
+        send(state["chat_id"], "✅ <b>핫딜 알리미 연결 완료</b>\n하루 4번(07:20·12:00·18:00·22:30) 관심 딜과 인기 딜을 모아서 보내드릴게요.")
 
     gap = time.time() - state.get("last_run", time.time())
-    if gap > 2 * 3600:                     # PC가 꺼져 있었음 → 다음 수집의 인기 딜을 '쉬는 동안' 요약으로 표시
-        state["resumed_hours"] = round(gap / 3600)
+    if gap > 2 * 3600:                     # PC가 꺼져 있었음 (다음 알림 시각에 밀린 딜이 함께 나감)
         log(f"{gap / 3600:.1f}시간 만에 실행됨")
 
     now = datetime.now(KST)
     enabled = [n for n in SOURCES if CONFIG.get("sources", {}).get(n, True)]
-    night = is_quiet(now)                  # 방해 금지 시간: 수집·알림 없음 (명령 답장만)
+    slot = scan_slot(now)
+    send_now = bool(slot) and slot != state.get("last_slot")
     every = CONFIG.get("collect_minutes", {})
     last = state.get("last_collect_src", {})
     due = [n for n in enabled
            if time.time() - last.get(n, 0) >= (every.get(n, 30) if isinstance(every, dict) else every) * 60]
+    if send_now:                           # 알림 직전에는 최신 글·추천 수로 한 번 더 (펨코는 1시간 넘었을 때만)
+        due += [n for n in enabled if n not in due
+                and time.time() - last.get(n, 0) >= (3600 if n == "fmkorea" else 0)]
     retry = [n for n in enabled if state.get("pending", {}).get(n) and not is_blocked(state, n)]
-    names = [n for n in enabled if FORCE_SCAN or (not night and (n in due or n in retry))]
+    names = [n for n in enabled if FORCE_SCAN or n in due or n in retry]   # 수집은 밤에도 조용히 계속
     names = [n for n in names if FORCE_SCAN or not is_blocked(state, n)]   # 막힌 사이트는 기다림
     if names:
         if retry:
@@ -1128,9 +1178,8 @@ def main():
     else:
         log("이번 실행은 명령만 처리")
 
-    slot = scan_slot(now)
-    if slot and slot != state.get("last_slot"):
-        send_digest(state)
+    if send_now:                           # 알림은 정해진 시각(기본 07:20·12:00·18:00·22:30)에만
+        send_digest(state, now)
         state["last_slot"] = slot
     state["last_run"] = time.time()
     state["errors"] = 0
