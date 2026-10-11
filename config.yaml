@@ -23,7 +23,7 @@ quiet_hours: {start: "23:00", end: "07:20"}
 
 # 사이트별 새 글 수집 간격(분). 수집한 딜은 알림 시각까지 모아 둠
 # 펨코는 보안 시스템이 잦은 자동 접속을 막으므로 간격을 길게 (막히면 1→2→4→8→12시간 쉬었다가 재시도)
-collect_minutes: {fmkorea: 120, ppomppu: 30}
+collect_minutes: {fmkorea: 180, ppomppu: 30}   # 2026-10-10: 펨코 36시간 차단 → 120→180분
 
 # 🔥 인기 딜: 키워드와 상관없이 올라온 지 max_age_hours 안에 추천(votes)이나 댓글(comments)이 기준을 넘으면 알림
 popular:
@@ -31,7 +31,7 @@ popular:
   max_age_hours: 8
   bargain_ratio: 0.85        # 단가 기준보다 이만큼(15%) 더 싸면 ⚡ 즉시 알림
   history_bargain_ratio: 0.8 # 최근 30일 가격 이력의 중간값보다 20% 이상 싸면 ⚡ 즉시 알림 (이력 5건 이상일 때)
-  fmkorea: {votes: 30, comments: 60, pages: 2}   # pages: 인기 갱신을 위해 매번 볼 페이지 수
+  fmkorea: {votes: 30, comments: 60, pages: 1}   # pages: 인기 갱신을 위해 매번 볼 페이지 수 (펨코는 2페이지째에서 430이 나서 1로)
   ppomppu: {votes: 8, comments: 30, pages: 3}
 
 # 명령 해석·연관어 생성에 쓰는 Gemini 모델 (앞에서부터 시도)

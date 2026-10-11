@@ -895,11 +895,18 @@ def send_bundle(state, title, sections):
     if row:
         btns.append(row)
     msgs.append((cur, btns))
+    failed = set()
     for i, (m, b) in enumerate(msgs):
         res = send(state["chat_id"], render(m), b, silent=i > 0)     # 길어서 나뉘면 두 번째부터는 무음
         if res and res.get("message_id"):     # 종료 표시를 위해 24시간 보관
             state.setdefault("msgs", []).append({**m, "mid": res["message_id"], "buttons": b, "t": time.time()})
+        elif res is None:                     # 전송 실패 → 보낸 것으로 치지 않음 (다음 알림 시각에 다시)
+            for blk in m["blocks"]:
+                for x in blk["ids"]:
+                    failed.add(x)
+                    state.get("alerted", {}).pop(x, None)
     state["msgs"] = [m for m in state.get("msgs", []) if time.time() - m["t"] < 24 * 3600]
+    return failed
 
 
 def mark_ended(state, ended_ids):
@@ -999,6 +1006,12 @@ def collect(state, data, names):
             pending.pop(name, None)
             state.setdefault("fail", {})[name] = 0
             state.setdefault("fail_since", {}).pop(name, None)
+            continue
+        # PC가 절전에서 막 깨어나 인터넷이 아직 안 붙은 경우(DNS·연결 오류)는 차단이 아니므로 10분 뒤 다시 시도
+        if isinstance(err, requests.ConnectionError) and getattr(err, "response", None) is None:
+            state.setdefault("blocked_until", {})[name] = time.time() + 600
+            pending[name] = True
+            log(f"{name}: 인터넷 연결 오류라 10분 뒤 다시 시도: {type(err).__name__}")
             continue
         # 실패: 점점 길게 쉬었다가 다시 시도 (1→2→4→8→12시간). 짧게 자주 두드리면 차단이 계속 연장됨
         n = state.setdefault("fail", {}).get(name, 0) + 1
@@ -1127,8 +1140,11 @@ def send_digest(state, now):
     pops = [it for it, _ in by_sec["pop"]]
     reasons = popular_reasons(pops) if pops else {}
     log("알림 전송: " + ", ".join(f"{s} {len(v)}건" for s, v in by_sec.items()))
-    send_bundle(state, f"🛒 <b>핫딜 알림</b> {now:%H:%M} —",
-                [(head, by_sec[s], kind, reasons if s == "pop" else None) for s, head, kind in SECTIONS])
+    failed = send_bundle(state, f"🛒 <b>핫딜 알림</b> {now:%H:%M} —",
+                         [(head, by_sec[s], kind, reasons if s == "pop" else None) for s, head, kind in SECTIONS])
+    if failed:                             # 네트워크 장애 등으로 못 보낸 딜은 대기열로 되돌림
+        state["queue"] = [q for q in queue if q["item"]["id"] in failed] + state.get("queue", [])
+        log(f"⚠️ 전송 못 한 딜 {len(failed)}건을 다음 알림 시각으로 미룸")
 
 
 # ───────────────────────── 메인 ─────────────────────────
